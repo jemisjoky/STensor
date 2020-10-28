@@ -1,4 +1,4 @@
-from functools import lru_cache
+import functools
 
 import torch
 
@@ -7,7 +7,7 @@ import torch
 # Function giving the target one-norm of a STensor based on its shape.
 # TARGET_SCALE is a sort of module-wise hyperparameter whose choice
 # influences the stability of operations on STensor instances
-@lru_cache()
+@functools.lru_cache()
 def TARGET_SCALE(shape, nb):
     if isinstance(shape, torch.Tensor):
         shape = shape.shape
@@ -21,30 +21,52 @@ def TARGET_SCALE(shape, nb):
 
 ### STensor core tools ###
 
+def stensor(data, part_idx, dtype=None, device=None, requires_grad=False, pin_memory=False):
+    """
+    Constructs a STensor from input data and a partition index placement
+
+    Args:
+        data: Initial data for the stensor. Can be a list, tuple,
+            NumPy ``ndarray``, scalar, and other types.
+        part_idx: Location of partition of data axes separating 
+            batch axes and data axes, with negative values counted 
+            from end of data tensor
+        dtype (optional): the desired data type of returned tensor.
+            Default: if ``None``, infers data type from :attr:`data`.
+        device (optional): the desired device of returned tensor.
+            Default: if ``None``, uses the current device for the default tensor type
+            (see :func:`torch.set_default_tensor_type`). :attr:`device` will be the CPU
+            for CPU tensor types and the current CUDA device for CUDA tensor types.
+        requires_grad (bool, optional): If autograd should record operations on the
+            returned tensor. Default: ``False``.
+        pin_memory (bool, optional): If set, returned tensor would be allocated in
+            the pinned memory. Works only for CPU tensors. Default: ``False``.
+    """
+    if isinstance(data, STensor):
+        return data.rescale()
+
+    # Convert data to Pytorch tensor if it's not already
+    if not isinstance(data, torch.Tensor):
+        data = torch.tensor(data)
+
+    # Initialize with trivial scale tensor
+    d_shape = data.shape
+    b_shape = d_shape[:part_idx]
+    scale = torch.zeros(b_shape, requires_grad=data.requires_grad, 
+                        dtype=data.dtype, layout=data.layout, device=data.device)
+
+    # Build and rescale STensor
+    stensor = STensor(data, scale)
+    stensor.rescale_()
+    return stensor
+
 class STensor:
     def __init__(self, data, scale):
         # Check that the shapes of data and scale tensors are compatible
-        batch_shape = scale.shape
-        assert data.shape[:len(batch_shape)] == batch_shape
+        assert data.shape[:len(scale.shape)] == scale.shape
 
         self.data = data
         self.scale = scale
-
-
-    # Handles indexing of STensor
-    # def __getitem__(self, key):
-    #     num_inds = len(key) if hasattr(key, '__len__') else 1
-    #     nb = len(self.scale.shape)
-
-    #     # Only indexing of batch indices is supported
-    #     if num_inds > nb:
-    #         raise ValueError("Attempted to index beyond batch indices of "
-    #                         f"HomArray ({num_inds} indices requested, but "
-    #                         f"only {max_inds} in HomArray). Maybe try "
-    #                         "using to_array first, then indexing?")
-    #     else:
-    #         return STensor(self.data.__getitem__(key),
-    #                         scale=self.scale.__getitem__(key))
 
     def __repr__(self):
         return f"STensor(tensor={self.data},\nscale={self.scale})"
@@ -107,10 +129,85 @@ class STensor:
 
 ### Pytorch functions on STensors ###
 
+def ensure_stensor(inp):
+    """Convert an input into STensor, if needed"""
+    if isinstance(inp, STensor):
+        return inp
+    else:
+        return stensor(inp)
+
+def hom_wrap(torch_fun, in_homs, out_homs):
+    """
+    Wrapper for reasonably simple homogeneous Pytorch functions
+
+    Args:
+        torch_fun: Homogeneous Pytorch function to be wrapped
+        in_homs:   List of tuples, each of the form (hom_ind, hom_deg), 
+                   where hom_ind gives the numerical position of a 
+                   homogeneous input argument of torch_fun and hom_deg 
+                   gives the degree of homoegeneity
+        out_homs:  List of tuples of the same format as in_homs giving
+                   homogeneity info for the outputs of torch_fun
+    """
+    # Handle case of homogeneous input _region_
+    if in_homs[-1][0] < 0:
+        # Negative indices of -n in last entry of in_homs denotes that 
+        # (n-1)th and future entries to torch_fun are homogeneous
+        in_regs = True
+        reg_start, reg_deg = in_homs.pop()
+        reg_start = -reg_start - 1
+    else:
+        in_regs = False
+
+    # Reinterpret in_homs as dictionary
+    in_homs = {idx: deg for idx, deg in in_homs}
+
+    # Reinterpret out_homs as dictionary
+    out_homs = {idx: deg for idx, deg in out_homs}
+
+    @functools.wraps(torch_fun)
+    def stable_fun(*args, **kwargs):
+        # TODO: Extract reference batch shape from input
+        
+        # Process input arguments, extract homogeneous positional args
+        all_args, in_scales = [], []
+        for i, t in enumerate(args):
+            if i in in_homs or (in_regs and i >= reg_start):
+
+                # Homogeneous input args
+                t = ensure_stensor(t)
+                all_args.append(t.data)
+                deg = reg_deg if in_regs and i>=reg_start else in_homs[i]
+                in_scales.append(deg * t.scale)
+
+            else:
+                # Nonhomogeneous input args
+                all_args.append(t)
+
+        # Compute overall rescaling associated with input tensors
+        if len(in_scales) > 1:
+            out_scale = sum(torch.broadcast_tensors(in_scales))
+        else:
+            out_scale = in_scales.pop()
+
+        # Call wrapped Pytorch function, get output as list
+        output = torch_fun(*all_args, **kwargs)
+        output = list(output) if isinstance(output, tuple) else [output]
+
+        # Convert entries of outputs to STensors as needed
+        for i, t in enumerate(output):
+            if i in out_homs:
+                stens = STensor(t, out_homs[i]*out_scale)
+                stens.rescale_()
+                output[i] = stens
+
+        return tuple(output)
+
+    return stable_fun
 
 
 
-# Doesn't make sense with STensors, and/or method doesn't have PyTorch
+# Doesn't make sense with stensors, and/or method doesn't have PyTorch
 # documentation. Not implementing
 DOUBTFUL = ['affine_grid_generator', 'align_tensors', 'alpha_dropout', 
 'alpha_dropout_', 'adaptive_avg_pool1d', 'adaptive_max_pool1d', 'arange', 
@@ -202,3 +299,8 @@ LATER = ['addbmm', 'addcdiv', 'addcmul', 'addmm', 'addmv', 'addmv_', 'addr',
 'chunk', 'clone', 'combinations', 'cummax', 'cummin', 'diag_embed', 'diagflat', 
 'full', 'full_like', 'narrow', 'orgqr', 'ormqr', 'roll', 'slogdet', 'where', ]
 
+if __name__ == '__main__':
+    s_mv = hom_wrap(torch.mv, [(0, 1), (1, 1)], [(0, 1)])
+    m = torch.ones((2,2))
+    v = torch.ones((2,))
+    print(s_mv(m, v))
