@@ -4,8 +4,8 @@ import torch
 
 # from stable_funs import STABLE_FUNCTIONS
 
-# Function giving the target two-norm of a STensor based on its shape.
-# TARGET_P2 is a sort of module-wise hyperparameter whose choice
+# Function giving the target one-norm of a STensor based on its shape.
+# TARGET_SCALE is a sort of module-wise hyperparameter whose choice
 # influences the stability of operations on STensor instances
 @lru_cache()
 def TARGET_SCALE(shape, nb):
@@ -15,18 +15,19 @@ def TARGET_SCALE(shape, nb):
     shape = shape[nb:]
 
     # We want to have one_norm(tensor) ~= num_el
-    return torch.floor(torch.log2(torch.prod(torch.tensor(shape))))
+    # return torch.log2(torch.prod(torch.tensor(shape)).float())
+    return torch.log2(torch.sqrt(torch.prod(torch.tensor(shape)).float()))
 
 
 ### STensor core tools ###
 
 class STensor:
-    def __init__(self, tensor, scale):
-        # Check that the shapes of tensor and scale are compatible
+    def __init__(self, data, scale):
+        # Check that the shapes of data and scale tensors are compatible
         batch_shape = scale.shape
-        assert tensor.shape[:len(batch_shape)] == batch_shape
+        assert data.shape[:len(batch_shape)] == batch_shape
 
-        self.tensor = tensor
+        self.data = data
         self.scale = scale
 
 
@@ -42,15 +43,15 @@ class STensor:
     #                         f"only {max_inds} in HomArray). Maybe try "
     #                         "using to_array first, then indexing?")
     #     else:
-    #         return STensor(self.tensor.__getitem__(key),
+    #         return STensor(self.data.__getitem__(key),
     #                         scale=self.scale.__getitem__(key))
 
     def __repr__(self):
-        return f"STensor(tensor={self.tensor},\nscale={self.scale})"
+        return f"STensor(tensor={self.data},\nscale={self.scale})"
 
     @property
     def shape(self):
-        return self.tensor.shape
+        return self.data.shape
 
     @property
     def batch_shape(self):
@@ -58,11 +59,40 @@ class STensor:
 
     @property
     def data_shape(self):
-        return self.tensor.shape[self.num_batch:]
+        return self.data.shape[self.num_batch:]
 
     @property
     def num_batch(self):
         return len(self.scale.shape)
+
+    @property
+    def num_data(self):
+        return len(self.data.shape) - self.num_batch
+
+    def rescale_(self):
+        """In-place rescaling method"""
+        nb, nt = self.num_batch, len(self.shape)
+        tens_scale = torch.sum(self.data.abs(), dim=list(range(nb, nt)), 
+                                keepdim=True)
+        log_shift = torch.floor(TARGET_SCALE(self.shape, nb) - 
+                                torch.log2(tens_scale))
+        self.data *= 2**log_shift
+        self.scale -= log_shift.view_as(self.scale)
+
+    def rescale(self):
+        """Return STensor with rescaled data"""
+        nb, nt = self.num_batch, len(self.shape)
+        tens_scale = torch.sum(self.data.abs(), dim=list(range(nb, nt)), 
+                                keepdim=True)
+        log_shift = torch.floor(TARGET_SCALE(self.shape, nb) - 
+                                torch.log2(tens_scale))
+        return STensor(self.data*(2**log_shift), 
+                       self.scale-log_shift.view_as(self.scale))
+
+    def as_tensor(self):
+        """Return destabilized Tensor version of STensor"""
+        long_shape = self.batch_shape + (1,)*self.num_data
+        return self.data * 2**self.scale.view(long_shape)
 
     def __torch_function__(self, fun, types, args=(), kwargs=None):
         if kwargs is None:
@@ -74,56 +104,14 @@ class STensor:
         else:
             return NotImplemented
 
-def stabilize(tensor, nb):
-    """
-    Convert tensor and information about batch indices into STensor
-    """
-    shape = tensor.shape
-    assert len(shape) >= nb >= 0
-
-    # Get input and target/desired powers of 2
-    norms = torch.norm(tensor.reshape(shape[:nb] + (-1,)), dim=-1)
-    input_scale = torch.floor(torch.log2(norms))
-    target_scale = TARGET_SCALE(shape, nb)
-
-    # Rescale the input tensor to have log two-norm near target_scale
-    delta_scale = input_scale - target_scale
-    tensor *= 2**bbcast(-delta_scale, tensor)
-
-    return STensor(tensor, delta_scale)
-
-def destabilize(stensor):
-    """
-    Convert STensor into regular Tensor
-    """
-    return rescale(stensor.tensor, stensor.scale)
-
-def rescale(tensor, scale):
-    """
-    Rescale a Tensor by powers of 2 from rescaling array
-    """
-    # Add singleton dimensions to scale to be compatible with tensor
-    t_shape, scale_shape = tensor.shape, scale.shape
-    len_diff = len(t_shape) - len(scale_shape)
-    scale = scale.reshape(scale_shape + (1,)*len_diff)
-
-    # Return the rescaled tensor
-    return tensor * 2**scale
-
-def rescale_(stensor, scale):
-    """
-    Rescale an STensor in-place by powers of 2 from rescaling array
-    """
-    assert stensor.scale.shape == scale.shape
-    stensor.scale += scale
-
-
 
 ### Pytorch functions on STensors ###
 
-STABLE_FUNCTIONS = {}
 
 
+
+# Doesn't make sense with STensors, and/or method doesn't have PyTorch
+# documentation. Not implementing
 DOUBTFUL = ['affine_grid_generator', 'align_tensors', 'alpha_dropout', 
 'alpha_dropout_', 'adaptive_avg_pool1d', 'adaptive_max_pool1d', 'arange', 
 'as_strided', 'as_strided_', 'avg_pool1d', 'bartlett_window', 'batch_norm', 
@@ -175,8 +163,8 @@ DOUBTFUL = ['affine_grid_generator', 'align_tensors', 'alpha_dropout',
 'set_flush_denormal', 'set_grad_enabled', 'set_num_interop_threads', 'set_num_threads', 
 'set_printoptions', 'set_rng_state', 'smm', 'softmax', 'sparse_coo_tensor', 
 'split_with_sizes', 'spmm', 'sspaddmm', 'sub', 'tensor', 'threshold', 'threshold_', 
-'topk', 'triangular_solve', 'tril_indices', 'triu_indices', 'triplet_margin_loss', 
-'typename', 'unbind', 'unsqueeze', 'wait', 'where', 'zero_', 'zeros', 'zeros_like',]
+'topk', 'tril_indices', 'triu_indices', 'triplet_margin_loss', 'typename', 'unbind', 
+'wait', 'zero_', 'zeros', 'zeros_like', ]
 
 # Important and/or easy functions
 TORCH = ['acos', 'acos_', 'angle', 'asin', 'asin_', 'atan', 'atan2', 'atan_', 
@@ -194,8 +182,9 @@ HOMOG = ['abs', 'abs_', 'bmm', 'cartesian_prod', 'conj', 'cosine_similarity', 'c
 'div', 'dot', 'eig', 'ger', 'imag', 'real', 'inverse', 'lstsq', 'lu', 'lu_solve', 'matmul', 
 'mm', 'mode', 'mul', 'mv', 'pdist', 'pinverse', 'qr', 'reciprocal', 'reciprocal_', 
 'square', 'square_', 'stack', 'std', 'std_mean', 'svd', 'sum', 'symeig', 't', 'take', 
-'svd_lowrank', 'tensordot', 'trace', 'transpose', 'tril', 'triu', 'trapz', 
-'true_divide', 'unique', 'unique_consecutive', 'var_mean', 'var', ]
+'svd_lowrank', 'tensordot', 'trace', 'transpose', 'triangular_solve', 'solve', 
+'tril', 'triu', 'trapz', 'true_divide', 'unique', 'unique_consecutive', 
+'var_mean', 'var', ]
 DO_NOW = ['add', 'cumsum', 'dist', 'einsum', 'eq', 'ne', 'equal', 'ge', 'gt', 'le', 'lt', 
 'log', 'log10', 'log10_', 'log1p', 'log1p_', 'log2', 'log2_', 'log_', 'max', 'min', 
 'prod', 'sign', 'sqrt', 'sqrt_', 'rsqrt', 'rsqrt_', ]
@@ -205,30 +194,11 @@ DO_SOON = ['allclose', 'all', 'any', 'argmax', 'argmin', 'argsort', 'as_tensor',
 'broadcast_tensors', 'cat', 'chain_matmul', 'cumprod', 'det', 'detach', 
 'detach_', 'device', 'diag', 'diagonal', 'dtype', 'flatten', 'flip', 'floor_divide', 
 'gather', 'logsumexp', 'matrix_power', 'mean', 'median', 'pow', 'reshape', 'resize_as_', 
-'squeeze', 'unsqueeze', 'solve', 'sort', 'split', ]
+'squeeze', 'unsqueeze', 'sort', 'split', ]
 
 # Not important, could be tough
 LATER = ['addbmm', 'addcdiv', 'addcmul', 'addmm', 'addmv', 'addmv_', 'addr', 
 'baddbmm', 'cdist', 'cholesky', 'cholesky_inverse', 'cholesky_solve', 
 'chunk', 'clone', 'combinations', 'cummax', 'cummin', 'diag_embed', 'diagflat', 
-'full', 'full_like', 'narrow', 'orgqr', 'ormqr', 'roll', 'slogdet', ]
+'full', 'full_like', 'narrow', 'orgqr', 'ormqr', 'roll', 'slogdet', 'where', ]
 
-
-# # Helper functions for setting up numpy namespace below
-# def _jnp_lookup(fun_name):
-#     if fun_name[:7] == 'linalg.':
-#         return getattr(jnp.linalg, fun_name[7:])
-#     else:
-#         return getattr(jnp, fun_name)
-# def _hjnp_lookup(fun_name):
-#     return homogenize(_jnp_lookup(fun_name))
-
-# # Namespace which can hold all of the JAX Numpy functionality
-# numpy = SimpleNamespace(linalg=SimpleNamespace())
-# _hom_jnp = {name: _hjnp_lookup(name) for name in hom_lookup.keys() 
-#                                        if name[:7] != 'linalg.'}
-# _hom_jnpla = {name[7:]: _hjnp_lookup(name) for name in hom_lookup.keys() 
-#                                        if name[:7] == 'linalg.'}
-# numpy.__dict__.update(**_hom_jnp)
-# numpy.linalg.__dict__.update(**_hom_jnpla)
-# numpy.einsum = hom_einsum
