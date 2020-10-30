@@ -69,35 +69,45 @@ def rescale_2p(stens):
     return STensor(stens.data*(2**log_shift.view(long_shape)), 
                    stens.scale-log_shift)
 
-
-
-
+# # Testing out how to add in-place methods externally
+# class MyClass:
+#     def __init__(self, data):
+#         self.data = data
+# def increase_data(self):
+#     self.data = self.data + 1
+# setattr(MyClass, 'increase_data', increase_data)
 
 if __name__ == '__main__':
-    # Define tensors and stensors
-    torch.manual_seed(0)
-    scale_tensor = torch.zeros((100,))
-    small_tensor = torch.randn((100, 2, 2, 2))
-    med_tensor = torch.randn((100, 5, 7, 10))
-    big_tensor = torch.randn((100, 10, 20, 5, 4))
-    all_tensors = [small_tensor, med_tensor, big_tensor]
-    small_st, med_st, big_st = [STensor(t, scale_tensor) for t in all_tensors]
+    # myc = MyClass(0)
+    # print(myc.data)
+    # myc.increase_data()
+    # print(myc.data)
 
-    # Fill the cache
-    for t in all_tensors: TARGET_SCALE(t.shape, 1)
 
-    # Benchmarking experiments for rescaling
-    import timeit
-    from itertools import product
+    # # Define tensors and stensors
+    # torch.manual_seed(0)
+    # scale_tensor = torch.zeros((100,))
+    # small_tensor = torch.randn((100, 2, 2, 2))
+    # med_tensor = torch.randn((100, 5, 7, 10))
+    # big_tensor = torch.randn((100, 10, 20, 5, 4))
+    # all_tensors = [small_tensor, med_tensor, big_tensor]
+    # small_st, med_st, big_st = [STensor(t, scale_tensor) for t in all_tensors]
 
-    for tup, OP in product(zip(['sml', 'med', 'lrg'], 
-                               [small_st, med_st, big_st]), 
-                           ['rescale_1', 'rescale_1_', 
-                            'rescale_2', 'rescale_2_', 
-                            'rescale_1p', 'rescale_1p_', 
-                            'rescale_2p', 'rescale_2p_', 
-                            ]):
-        size, st = tup
-        command = f"{OP}(st)"
-        loading = f"from __main__ import {OP}, st"
-        print(f"({size}, {OP}): {timeit.timeit(command, setup=loading, number=10000)}")
+    # # Fill the cache
+    # for t in all_tensors: TARGET_SCALE(t.shape, 1)
+
+    # # Benchmarking experiments for rescaling
+    # import timeit
+    # from itertools import product
+
+    # for tup, OP in product(zip(['sml', 'med', 'lrg'], 
+    #                            [small_st, med_st, big_st]), 
+    #                        ['rescale_1', 'rescale_1_', 
+    #                         'rescale_2', 'rescale_2_', 
+    #                         'rescale_1p', 'rescale_1p_', 
+    #                         'rescale_2p', 'rescale_2p_', 
+    #                         ]):
+    #     size, st = tup
+    #     command = f"{OP}(st)"
+    #     loading = f"from __main__ import {OP}, st"
+    #     print(f"({size}, {OP}): {timeit.timeit(command, setup=loading, number=10000)}")

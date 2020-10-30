@@ -14,7 +14,7 @@ def TARGET_SCALE(shape, nb):
 
     # We want to have one_norm(tensor) ~= num_el
     # return torch.log2(torch.prod(torch.tensor(shape)).float())
-    return torch.log2(torch.sqrt(torch.prod(torch.tensor(shape)).float()))
+    return torch.log2(torch.prod(torch.tensor(shape)).float())
 
 
 ### STensor core tools ###
@@ -149,50 +149,40 @@ class STensor:
             return NotImplemented
 
 
-### Wrappers for converting Pytorch functions to ones on STensors ###
+### Tools to convert/register Pytorch functions as ones on STensors ###
 
 # Dictionary to store reimplemented Pytorch functions for use on stensors
 STABLE_FUNCTIONS = {}
 
-def register_from_name(fun_name, wrapper):
-    """Use torch function name and wrapper to register stabilized function"""
-    global STABLE_FUNCTIONS
-    torch_fun = getattr(torch, fun_name)
-    assert torch_fun not in STABLE_FUNCTIONS
-    stable_fun = wrapper(torch_fun)
-    STABLE_FUNCTIONS[torch_fun] = stable_fun
+def existing_method_from_name(fun_name):
+    """Add method to STensor for existing stable function"""
+    global STensor
+    assert hasattr(torch.Tensor, fun_name)
+    if getattr(torch, fun_name) in STABLE_FUNCTIONS:
+        stable_fun = STABLE_FUNCTIONS[getattr(torch, fun_name)]
+        setattr(STensor, fun_name, stable_fun)
+    else:
+        print(f"STILL NEED TO IMPLEMENT {fun_name}")
 
-def hom_wrap(torch_fun, in_homs, out_homs):
+def hom_wrap(fun_name, in_homs, in_place=False):
     """
     Wrapper for reasonably simple homogeneous Pytorch functions
 
     Args:
-        torch_fun: Homogeneous Pytorch function to be wrapped
+        fun_name:  Name of homogeneous Pytorch function to be wrapped
         in_homs:   List of tuples, each of the form (hom_ind, hom_deg), 
                    where hom_ind gives the numerical position of a 
                    homogeneous input argument of torch_fun and hom_deg 
                    gives the degree of homoegeneity
-        out_homs:  List of tuples of the same format as in_homs giving
-                   homogeneity info for the outputs of torch_fun
+        in_place:  Boolean specifying if we should implement the operation 
+                   as an in-place method
     """
-    # TODO: Simplify implementation to not need out_homs (only used for var_mean)
-    #       
-    # Handle case of homogeneous input _region_
-    if in_homs[-1][0] < 0:
-        # Negative indices -n in last entry of in_homs means that 
-        # (n-1)th and future entries to torch_fun are homogeneous
-        in_regs = True
-        reg_start, reg_deg = in_homs.pop()
-        reg_start = -reg_start - 1
+    # TODO: Deal with non-stensors as inputs
+    num_homs = len(in_homs)
+    if in_place:
+        torch_fun = getattr(torch.Tensor, fun_name)
     else:
-        in_regs = False
-
-    # Reinterpret in_homs, out_homs as dictionaries
-    in_homs = {idx: deg for idx, deg in in_homs}
-    out_homs = {idx: deg for idx, deg in out_homs}
-
-    # Function for checking if an argument index is homogeneous
-    hom_ind = lambda i: i in in_homs or (in_regs and i >= reg_start)
+        torch_fun = getattr(torch, fun_name)
 
     @functools.wraps(torch_fun)
     def stable_fun(*args, **kwargs):
@@ -202,15 +192,13 @@ def hom_wrap(torch_fun, in_homs, out_homs):
         # Separate out homogeneous args and put everything in all_args
         all_args, in_scales = [], []
         for i, t in enumerate(args):
-            if hom_ind(i):
+            if i < num_homs:
                 # Homogeneous input args
                 if not isinstance(t, STensor):
-                    breakpoint()
                     raise ValueError(f"Input argument {i} to stable version"
                                     f" {torch_fun.__name__} must be an STensor")
                 all_args.append(t.data)
-                deg = reg_deg if in_regs and i>=reg_start else in_homs[i]
-                in_scales.append(deg * t.scale)
+                in_scales.append(in_homs[i] * t.scale)
             else:
                 # Nonhomogeneous input args
                 all_args.append(t)
@@ -221,60 +209,69 @@ def hom_wrap(torch_fun, in_homs, out_homs):
         else:
             out_scale = in_scales.pop()
 
-        # Call wrapped Pytorch function, get output as list
-        output = torch_fun(*all_args, **kwargs)
-        output = list(output) if isinstance(output, tuple) else [output]
-
-        # Convert entries of outputs to STensors as needed
-        for i, t in enumerate(output):
-            if i in out_homs:
-                stens = STensor(t, out_homs[i]*out_scale)
-                stens.rescale_()
-                output[i] = stens
-
-        return tuple(output) if len(output) > 1 else output[0]
+        # Call wrapped Pytorch function, get output as list, and return
+        # Different behavior for in-place vs regular cases
+        if in_place:
+            # Call in-place method of data tensor, then readjust scale
+            self = args[0]  # <- Object whose method is being called
+            getattr(self.data, fun_name)(*all_args[1:], **kwargs)
+            self.scale = out_scale
+            self.rescale_()
+        else:
+            # Call Torch function with data, then convert to stensor
+            output = torch_fun(*all_args, **kwargs)
+            assert isinstance(output, torch.Tensor)
+            stens = STensor(output, out_scale)
+            stens.rescale_()
+            return stens
 
     return stable_fun
 
+def inplace_hom_method_from_name(fun_name):
+    """Add in-place versions of homogeneous function to STensor"""
+    assert hasattr(torch.Tensor, fun_name)
+    assert fun_name[-1] == '_'
+    in_homs = HOMOG[fun_name[:-1]]
+    stable_method = hom_wrap(fun_name, in_homs, in_place=True)
+    setattr(STensor, fun_name, stable_method)
+
 ### Re-registration of the Pytorch library as stable functions ###
 
-HOMOG = {'abs': ([(0, 1)], [(0, 1)]),
-         'bmm': ([(0, 1), (1, 1)], [(0, 1)]),
-         'conj': ([(0, 1)], [(0, 1)]),
-         'cosine_similarity': ([(0, 0), (1, 0)], [(0, 0)]),
-         'cross': ([(0, 1), (1, 1)], [(0, 1)]),
-         'div': ([(0, 1), (1, -1)], [(0, 1)]),
-         'dot': ([(0, 1), (1, 1)], [(0, 1)]),
-         'ger': ([(0, 1), (1, 1)], [(0, 1)]),
-         'imag': ([(0, 1)], [(0, 1)]),
-         'real': ([(0, 1)], [(0, 1)]),
-         'inverse': ([(0, -1)], [(0, 1)]),
-         'matmul': ([(0, 1), (1, 1)], [(0, 1)]),
-         'mm': ([(0, 1), (1, 1)], [(0, 1)]),
-         'mode': ([(0, 1)], [(0, 1)]),
-         'mul': ([(0, 1), (1, 1)], [(0, 1)]),
-         'mv': ([(0, 1), (1, 1)], [(0, 1)]),
-         'pinverse': ([(0, -1)], [(0, 1)]),
-         'reciprocal': ([(0, -1)], [(0, 1)]),
-         'relu': ([(0, 1)], [(0, 1)]),
-         'square': ([(0, 2)], [(0, 1)]),
-         'std': ([(0, 1)], [(0, 1)]),
-         'sum': ([(0, 1)], [(0, 1)]),
-         't': ([(0, 1)], [(0, 1)]),
-         'tensordot': ([(0, 1), (1, 1)], [(0, 1)]),
-         'trace': ([(0, 1)], [(0, 1)]),
-         'transpose': ([(0, 1)], [(0, 1)]),
-         'tril': ([(0, 1)], [(0, 1)]),
-         'triu': ([(0, 1)], [(0, 1)]),
-         'true_divide': ([(0, -1)], [(0, 1)]),
-         'var': ([(0, 2)], [(0, 1)]),
+HOMOG = {'abs': (1,),
+         'bmm': (1, 1),
+         'conj': (1,),
+         'cosine_similarity': (0, 0),
+         'cross': (1, 1),
+         'div': (1, -1),
+         'dot': (1, 1),
+         'ger': (1, 1),
+         'imag': (1,),
+         'real': (1,),
+         'inverse': (-1,),
+         'matmul': (1, 1),
+         'mm': (1, 1),
+         'mode': (1,),
+         'mul': (1, 1),
+         'mv': (1, 1),
+         'pinverse': (-1,),
+         'reciprocal': (-1,),
+         'relu': (1,),
+         'square': (2,),
+         'std': (1,),
+         'sum': (1,),
+         't': (1,),
+         'tensordot': (1, 1),
+         'trace': (1,),
+         'true_divide': (-1,),
+         'var': (2,),
          }
 
 # Register all homogeneous functions as possible functions on stensors
-for fun_name, value in HOMOG.items():
-    in_homs, out_homs = value
-    wrapper = functools.partial(hom_wrap, in_homs=in_homs, out_homs=out_homs)
-    register_from_name(fun_name, wrapper)
+for fun_name, in_homs in HOMOG.items():
+    torch_fun = getattr(torch, fun_name)
+    assert torch_fun not in STABLE_FUNCTIONS
+    stable_fun = hom_wrap(fun_name, in_homs, in_place=False)
+    STABLE_FUNCTIONS[torch_fun] = stable_fun
 
 # Doesn't make sense with stensors, and/or method doesn't have PyTorch
 # documentation. Not implementing
@@ -322,13 +319,12 @@ TORCH = ['acos', 'angle', 'asin', 'atan', 'atan2', 'cartesian_prod', 'ceil',
 'celu', 'clamp', 'clamp_max', 'clamp_min', 'conv1d', 'conv2d', 'conv3d', 'conv_tbc', 
 'conv_transpose1d', 'conv_transpose2d', 'conv_transpose3d', 'cos', 'cosh', 'digamma', 
 'erf', 'erfc', 'erfinv', 'exp', 'expm1', 'fft', 'floor', 'frac', 'fmod', 'ifft', 
-'irfft', 'is_complex', 'is_floating_point', 'is_nonzero', 'is_same_size', 
-'isfinite', 'isinf', 'isnan', 'kthvalue', 'lerp', 'lgamma', 'logdet', 'logical_and', 
-'logical_not', 'logical_or', 'logical_xor', 'numel', 'rfft', 
+'irfft', 'is_complex', 'is_floating_point', 'is_nonzero', 'is_same_size', 'kthvalue', 
+'lerp', 'lgamma', 'logdet', 'numel', 'rfft', 
 'round', 'sigmoid', 'sin', 'sinh', 'stft', 'tan', 'tanh', 'trunc', ]
 DO_NOW = ['add', 'cumsum', 'dist', 'einsum', 'eq', 'ne', 'equal', 'ge', 'gt', 'le', 'lt', 
-'log', 'log10', 'log1p', 'log2', 'max', 'min', 
-'prod', 'sign', 'sqrt', 'rsqrt', ]
+'log', 'log10', 'log1p', 'log2', 'logical_and', 'logical_not', 'logical_or', 'logical_xor', 
+'max', 'min', 'prod', 'sign', 'sqrt', 'rsqrt', 'isfinite', 'isinf', 'isnan', ]
 
 # Somewhat important and/or trickier functions
 DO_SOON = ['allclose', 'all', 'any', 'argmax', 'argmin', 'argsort', 
@@ -338,6 +334,7 @@ DO_SOON = ['allclose', 'all', 'any', 'argmax', 'argmin', 'argsort',
 'mean', 'median', 'pow', 'reshape', 'squeeze', 'unsqueeze', 'sort', 'split', 
 # Homogeneous functions that for one reason or another can't be handled by hom_wrap
 'pdist', 'trapz', 'take', 'unique_consecutive', 'var_mean', 'lu_solve', 'std_mean', 
+'tril', 'triu', 'transpose', 
 # Matrix decompositions whose return types must be respected
 'qr', 'eig', 'lstsq', 'svd', 'symeig', 'triangular_solve', 'solve']
 # ***broadcast_{batch,data}***: Functions which only broadcast a subset of the indices,
@@ -349,12 +346,128 @@ LATER = ['addbmm', 'addcdiv', 'addcmul', 'addmm', 'addmv', 'addr',
 'chunk', 'clone', 'combinations', 'cummax', 'cummin', 'diag_embed', 'diagflat', 
 'full_like', 'narrow', 'orgqr', 'ormqr', 'roll', 'slogdet', 'where', ]
 
+ALL_FUN = list(HOMOG.keys()) + DOUBTFUL + TORCH + DO_NOW + DO_SOON + LATER
+
+### Register stabilized Pytorch functions as methods for stensors ###
+
+EXISTING_METHOD = ['abs', 'bmm', 'conj', 'cross', 'div', 'dot', 'ger', 'inverse', 
+'matmul', 'mm', 'mode', 'mul', 'mv', 'pinverse', 'reciprocal', 'relu', 'square', 
+'std', 'sum', 't', 'trace', 'transpose', 'tril', 'triu', 'true_divide', 'var',
+'acos', 'angle', 'asin', 'atan', 'atan2', 'ceil', 'clamp', 
+'clamp_max', 'clamp_min', 'cos', 'cosh', 'digamma', 'erf', 'erfc', 'erfinv', 
+'exp', 'expm1', 'fft', 'floor', 'fmod', 'frac', 'ifft', 'irfft', 'is_complex', 
+'is_floating_point', 'is_nonzero', 'is_same_size', 'kthvalue', 'lerp', 'lgamma', 
+'logdet', 'logical_and', 'logical_not', 'logical_or', 'logical_xor', 'numel', 
+'rfft', 'round', 'sigmoid', 'sin', 'sinh', 'stft', 'tan', 'tanh', 'trunc']
+
+HOM_INPLACE = ['abs_', 'div_', 'mul_', 'reciprocal_', 'relu_', 'square_', 't_', 
+'true_divide_']
+
+# Add all methods which I've already implement as stable functions
+for name in EXISTING_METHOD:
+    existing_method_from_name(name)
+
+# Implement in-place versions of homogeneous functions
+for name in HOM_INPLACE:
+    inplace_hom_method_from_name(name)
+
+TORCH_INPLACE = ['acos_', 'asin_', 'atan2_', 'atan_', 'ceil_', 'clamp_', 'clamp_max_', 
+'clamp_min_', 'cos_', 'cosh_', 'digamma_', 'erf_', 'erfc_', 'erfinv_', 'exp_', 'expm1_', 
+'floor_', 'fmod_', 'frac_', 'lerp_', 'lgamma_', 'round_', 'sigmoid_', 'sin_', 
+'sinh_', 'tan_', 'tanh_', 'trunc_']
+
+ATTRIBUTES = ['T', '__abs__', '__add__', '__and__' ,'__array__', '__array_priority__', 
+'__array_wrap__', '__bool__', '__contains__', '__deepcopy__', '__delitem__', 
+'__div__', '__float__', '__floordiv__', '__getitem__', '__iadd__', '__iand__', 
+'__idiv__', '__ifloordiv__', '__ilshift__', '__imul__', '__index__', '__int__', 
+'__invert__', '__ior__', '__ipow__', '__irshift__', '__isub__', '__iter__', 
+'__itruediv__', '__ixor__', '__len__', '__long__', '__lshift__', '__matmul__', '__mod__', 
+'__mul__', '__neg__', '__nonzero__', '__or__', '__pow__', '__radd__', '__rdiv__', 
+'__reversed__', '__rfloordiv__', '__rmul__', '__rpow__', '__rshift__', '__rsub__', 
+'__rtruediv__', '__setitem__', '__setstate__', '__sub__', '__truediv__', '__xor__', 
+
+'_backward_hooks', '_base', '_cdata', '_coalesced_', '_dimI', '_dimV', '_grad', 
+'_grad_fn', '_indices', '_is_view', '_make_subclass', '_nnz', '_update_names', '_values', 
+'_version', 'abs', 'abs_', 'acos', 'acos_', 'add', 'add_', 'addbmm', 'addbmm_', 'addcdiv', 
+'addcdiv_', 'addcmul', 'addcmul_', 'addmm', 'addmm_', 'addmv', 'addmv_', 'addr', 'addr_', 
+'align_as', 'align_to', 'all', 'allclose', 'angle', 'any', 'apply_', 'argmax', 'argmin', 
+'argsort', 'as_strided', 'as_strided_', 'asin', 'asin_', 'atan', 'atan2', 'atan2_', 
+'atan_', 'backward', 'baddbmm', 'baddbmm_', 'bernoulli', 'bernoulli_', 'bfloat16', 
+'bincount', 'bitwise_and', 'bitwise_and_', 'bitwise_not', 'bitwise_not_', 'bitwise_or', 
+'bitwise_or_', 'bitwise_xor', 'bitwise_xor_', 'bmm', 'bool', 'byte', 'cauchy_', 'ceil', 
+'ceil_', 'char', 'cholesky', 'cholesky_inverse', 'cholesky_solve', 'chunk', 'clamp', 
+'clamp_', 'clamp_max', 'clamp_max_', 'clamp_min', 'clamp_min_', 'clone', 'coalesce', 
+'conj', 'contiguous', 'copy_', 'cos', 'cos_', 'cosh', 'cosh_', 'cpu', 'cross', 'cuda', 
+'cummax', 'cummin', 'cumprod', 'cumsum', 'data', 'data_ptr', 'dense_dim', 'dequantize', 
+'det', 'detach', 'detach_', 'device', 'diag', 'diag_embed', 'diagflat', 'diagonal', 
+'digamma', 'digamma_', 'dim', 'dist', 'div', 'div_', 'dot', 'double', 'dtype', 'eig', 
+'element_size', 'eq', 'eq_', 'equal', 'erf', 'erf_', 'erfc', 'erfc_', 'erfinv', 'erfinv_', 
+'exp', 'exp_', 'expand', 'expand_as', 'expm1', 'expm1_', 'exponential_', 'fft', 'fill_', 
+'fill_diagonal_', 'flatten', 'flip', 'float', 'floor', 'floor_', 'floor_divide', 
+'floor_divide_', 'fmod', 'fmod_', 'frac', 'frac_', 'gather', 'ge', 'ge_', 'geometric_', 
+'geqrf', 'ger', 'get_device', 'grad', 'grad_fn', 'gt', 'gt_', 'half', 'hardshrink', 
+'has_names', 'histc', 'ifft', 'index_add', 'index_add_', 'index_copy', 'index_copy_', 
+'index_fill', 'index_fill_', 'index_put', 'index_put_', 'index_select', 'indices', 'int', 
+'int_repr', 'inverse', 'irfft', 'is_coalesced', 'is_complex', 'is_contiguous', 'is_cuda', 
+'is_distributed', 'is_floating_point', 'is_leaf', 'is_mkldnn', 'is_nonzero', 'is_pinned', 
+'is_quantized', 'is_same_size', 'is_set_to', 'is_shared', 'is_signed', 'is_sparse', 
+'isclose', 'item', 'kthvalue', 'layout', 'le', 'le_', 'lerp', 'lerp_', 'lgamma', 
+'lgamma_', 'log', 'log10', 'log10_', 'log1p', 'log1p_', 'log2', 'log2_', 'log_', 
+'log_normal_', 'log_softmax', 'logdet', 'logical_and', 'logical_and_', 'logical_not', 
+'logical_not_', 'logical_or', 'logical_or_', 'logical_xor', 'logical_xor_', 'logsumexp', 
+'long', 'lstsq', 'lt', 'lt_', 'lu', 'lu_solve', 'map2_', 'map_', 'masked_fill', 
+'masked_fill_', 'masked_scatter', 'masked_scatter_', 'masked_select', 'matmul', 
+'matrix_power', 'max', 'mean', 'median', 'min', 'mm', 'mode', 'mul', 'mul_', 
+'multinomial', 'mv', 'mvlgamma', 'mvlgamma_', 'name', 'names', 'narrow', 'narrow_copy', 
+'ndim', 'ndimension', 'ne', 'ne_', 'neg', 'neg_', 'nelement', 'new', 'new_empty', 
+'new_full', 'new_ones', 'new_tensor', 'new_zeros', 'nonzero', 'norm', 'normal_', 'numel', 
+'numpy', 'orgqr', 'ormqr', 'output_nr', 'permute', 'pin_memory', 'pinverse', 'polygamma', 
+'polygamma_', 'pow', 'pow_', 'prelu', 'prod', 'put_', 'q_per_channel_axis', 
+'q_per_channel_scales', 'q_per_channel_zero_points', 'q_scale', 'q_zero_point', 'qr', 
+'qscheme', 'random_', 'reciprocal', 'reciprocal_', 'record_stream', 'refine_names', 
+'register_hook', 'reinforce', 'relu', 'relu_', 'remainder', 'remainder_', 'rename', 
+'rename_', 'renorm', 'renorm_', 'repeat', 'repeat_interleave', 'requires_grad', 
+'requires_grad_', 'reshape', 'reshape_as', 'resize', 'resize_', 'resize_as', 'resize_as_', 
+'retain_grad', 'rfft', 'roll', 'rot90', 'round', 'round_', 'rsqrt', 'rsqrt_', 'scatter', 
+'scatter_', 'scatter_add', 'scatter_add_', 'select', 'set_', 'shape', 'share_memory_', 
+'short', 'sigmoid', 'sigmoid_', 'sign', 'sign_', 'sin', 'sin_', 'sinh', 'sinh_', 'size', 
+'slogdet', 'smm', 'softmax', 'solve', 'sort', 'sparse_dim', 'sparse_mask', 
+'sparse_resize_', 'sparse_resize_and_clear_', 'split', 'split_with_sizes', 'sqrt', 
+'sqrt_', 'square', 'square_', 'squeeze', 'squeeze_', 'sspaddmm', 'std', 'stft', 
+'storage', 'storage_offset', 'storage_type', 'stride', 'sub', 'sub_', 'sum', 
+'sum_to_size', 'svd', 'symeig', 't', 't_', 'take', 'tan', 'tan_', 'tanh', 'tanh_', 'to', 
+'to_dense', 'to_mkldnn', 'to_sparse', 'tolist', 'topk', 'trace', 'transpose', 
+'transpose_', 'triangular_solve', 'tril', 'tril_', 'triu', 'triu_', 'true_divide', 
+'true_divide_', 'trunc', 'trunc_', 'type', 'type_as', 'unbind', 'unflatten', 'unfold', 
+'uniform_', 'unique', 'unique_consecutive', 'unsqueeze', 'unsqueeze_', 'values', 'var', 
+'view', 'view_as', 'where', 'zero_']
+
+
+### TODOS ###
+# (1)  Redo triu, tril to work with batch indices
+# (2)  Redo transpose to ensure we aren't flipping batch and data indices
+
+
 if __name__ == '__main__':
-    # m = stensor(torch.ones((5,2,2)), 1)
-    # v = stensor(torch.ones((5,2,3)), 1)
-    # mv = torch.bmm(m, v)
-    mat = stensor(1024*torch.eye(5), 0)
-    print(repr(torch.pinverse(mat)))
+    # mat = stensor(torch.randn(200, 200), 0)
+    # print(dir(mat))
+    # mat.scale *= 150
+    # print(mat.scale)
+    # print(torch.norm(mat.data))
+    # mat = mat.matmul(mat)
+    # print(mat.scale)
+    # print(torch.norm(mat.data))
+
+    # Get the nontrivial attributes of a Pytorch tensor
+    class Objer:
+        def __init__(self):
+            pass
+    obj = Objer()
+    tens_atts = [f for f in dir(torch.ones(2)) if f not in dir(obj)]
+    hom_atts = [f for f in tens_atts if f in HOMOG]
+    torch_atts = [f for f in tens_atts if f in TORCH]
+    other_atts = [f for f in tens_atts if f not in EXISTING_METHOD+HOM_INPLACE+TORCH_INPLACE]
+    # print(other_atts)
 
 
     # Make sure there aren't functions which can be overwridden but don't appear above
