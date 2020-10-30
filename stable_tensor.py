@@ -1,3 +1,4 @@
+import warnings
 import functools
 
 import torch
@@ -67,15 +68,15 @@ class STensor:
         self.scale = scale
 
     def __str__(self):
-        # Slap a disclaimer on any questionable printed values
+        # Disclaimer for any questionable printed values
         disclaimer = ("\ninf and/or zero entries may be artifact of conversion"
                       "\nto non-stable tensor, use repr to view underlying data")
-        t = self.to_tensor()
-        # Don't slap a disclaimer on normal printed values
-        if (torch.any(t != 0) or torch.all(self.data == 0)) \
-                            and torch.all(torch.isfinite(t)):
-            disclaimer = ""
-        # return f"STensor(\n{t}){disclaimer}"
+        # Check for warning during conversion, remove disclaimer if not needed
+        with warnings.catch_warnings(record=True) as wrec:
+            warnings.simplefilter("always")
+            t = self.to_tensor()
+            if len(wrec) == 0:
+                disclaimer = ""
         return f"stable\n{t}{disclaimer}"
 
     def __repr__(self):
@@ -137,7 +138,13 @@ class STensor:
     def to_tensor(self):
         """Return destabilized Tensor version of STensor"""
         long_shape = self.batch_shape + (1,)*self.num_data
-        return self.data * 2**self.scale.view(long_shape)
+        tensor = self.data * 2**self.scale.view(long_shape)
+        
+        # Check for and warn against errors in conversion
+        if bad_conversion(self, tensor):
+            warnings.warn("Underflow and/or overflow detected "
+                          "during to_tensor() call", RuntimeWarning)
+        return tensor
 
     def __torch_function__(self, fun, types, args=(), kwargs=None):
         if kwargs is None:
@@ -148,21 +155,17 @@ class STensor:
         else:
             return NotImplemented
 
+def bad_conversion(stens, tensor):
+    """Check if conversion to tensor led to underflow/overflow problems"""
+    underflow = torch.any(torch.logical_and(tensor==0, stens.data!=0))
+    overflow = torch.any(torch.logical_and(torch.isinf(tensor), 
+                                           torch.isfinite(stens.data)))
+    return underflow or overflow
 
 ### Tools to convert/register Pytorch functions as ones on STensors ###
 
 # Dictionary to store reimplemented Pytorch functions for use on stensors
 STABLE_FUNCTIONS = {}
-
-def existing_method_from_name(fun_name):
-    """Add method to STensor for existing stable function"""
-    global STensor
-    assert hasattr(torch.Tensor, fun_name)
-    if getattr(torch, fun_name) in STABLE_FUNCTIONS:
-        stable_fun = STABLE_FUNCTIONS[getattr(torch, fun_name)]
-        setattr(STensor, fun_name, stable_fun)
-    else:
-        print(f"STILL NEED TO IMPLEMENT {fun_name}")
 
 def hom_wrap(fun_name, in_homs, in_place=False):
     """
@@ -227,6 +230,82 @@ def hom_wrap(fun_name, in_homs, in_place=False):
 
     return stable_fun
 
+def torch_wrap(fun_name, in_place=False, data_only=False):
+    """
+    Wrapper for black-box Pytorch functions
+
+    Args:
+        fun_name:   Name of Pytorch function to be wrapped
+        in_place:   Boolean specifying if we should implement the 
+                    operation as an in-place method
+        data_only:  Whether to call function on data attribute alone, 
+                    rather than rescaled data, and to later return 
+                    unwrapped tensor
+    """
+    # TODO: Deal with non-stensors as inputs
+    assert not (in_place and data_only), fun_name
+    if in_place:
+        torch_fun = getattr(torch.Tensor, fun_name)
+    else:
+        torch_fun = getattr(torch, fun_name)
+
+    @functools.wraps(torch_fun)
+    def wrapped_fun(*args, **kwargs):
+        # TODO: Do shape inference to be able to handle non-stensor inputs, 
+        #       warn when there's ambiguity
+
+        # For in-place evaluation, pull out first input
+        if in_place:
+            self = args[0]  # <- Object whose method is being called
+            assert isinstance(self, STensor), ("Cannot call in-place torch.Tensor "
+                                               "methods with STensor as input")
+        # Replace any STensor args with Torch tensors
+        scale_list = []
+        args = list(args)
+        for i, t in enumerate(args):
+            if isinstance(t, STensor):
+                scale_list.append(t.scale)
+                args[i] = t.data if data_only else t.to_tensor()
+        assert len(scale_list) > 0, \
+                "STensor input must appear within positional arguments"
+
+        # Compute overall rescaling associated with input tensors
+        if len(scale_list) == 1:
+            num_batch = len(scale_list[0].shape)
+        else:
+            num_batch = len(torch.broadcast_tensors(*scale_list)[0].shape)
+
+        # Call wrapped Pytorch function, get output as list, and return.
+        # Different behavior required for in-place vs regular cases
+        if in_place:
+            # Call in-place method of data tensor, then readjust scale
+            self.data = args[0]
+            self.scale.zero_()
+            getattr(self.data, fun_name)(*args[1:], **kwargs)
+            self.rescale_()
+        else:
+            # Call Torch function with data, then convert to stensor
+            output = torch_fun(*args, **kwargs)
+            assert isinstance(output, torch.Tensor)
+            if data_only:
+                return output
+            else:
+                stens = stensor(output, num_batch)
+                stens.rescale_()
+                return stens
+
+    return wrapped_fun
+
+def existing_method_from_name(fun_name):
+    """Add method to STensor for existing stable function"""
+    global STensor
+    assert hasattr(torch.Tensor, fun_name)
+    if getattr(torch, fun_name) in STABLE_FUNCTIONS:
+        stable_fun = STABLE_FUNCTIONS[getattr(torch, fun_name)]
+        setattr(STensor, fun_name, stable_fun)
+    else:
+        print(f"STILL NEED TO IMPLEMENT {fun_name}")
+
 def inplace_hom_method_from_name(fun_name):
     """Add in-place versions of homogeneous function to STensor"""
     assert hasattr(torch.Tensor, fun_name)
@@ -235,8 +314,17 @@ def inplace_hom_method_from_name(fun_name):
     stable_method = hom_wrap(fun_name, in_homs, in_place=True)
     setattr(STensor, fun_name, stable_method)
 
+def inplace_torch_method_from_name(fun_name):
+    """Add in-place versions of simple torch function to STensor"""
+    assert hasattr(torch.Tensor, fun_name)
+    assert fun_name[-1] == '_'
+    data_only = TORCH[fun_name[:-1]]
+    wrapped_method = torch_wrap(fun_name, in_place=True, data_only=data_only)
+    setattr(STensor, fun_name, wrapped_method)
+
 ### Re-registration of the Pytorch library as stable functions ###
 
+# Values give degrees of homogeneity for each input
 HOMOG = {'abs': (1,),
          'bmm': (1, 1),
          'conj': (1,),
@@ -266,12 +354,77 @@ HOMOG = {'abs': (1,),
          'var': (2,),
          }
 
-# Register all homogeneous functions as possible functions on stensors
+# Values give data_only flag sent to torch_wrap
+TORCH = {'acos': False,
+         'angle': False,
+         'asin': False,
+         'atan': False,
+         'atan2': False,
+         'cartesian_prod': False,
+         'ceil': False,
+         'celu': False,
+         'clamp': False,
+         'clamp_max': False,
+         'clamp_min': False,
+         'conv1d': False,
+         'conv2d': False,
+         'conv3d': False,
+         'conv_tbc': False,
+         'conv_transpose1d': False,
+         'conv_transpose2d': False,
+         'conv_transpose3d': False,
+         'cos': False,
+         'cosh': False,
+         'digamma': False,
+         'erf': False,
+         'erfc': False,
+         'erfinv': False,
+         'exp': False,
+         'expm1': False,
+         'fft': False,
+         'floor': False,
+         'frac': False,
+         'fmod': False,
+         'ifft': False,
+         'irfft': False,
+         'is_complex': True,
+         'is_floating_point': True,
+         'is_nonzero': True,
+         'is_same_size': True,
+         'kthvalue': False,
+         'lerp': False,
+         'lgamma': False,
+         'logdet': False,
+         'logical_and': True,
+         'logical_not': True,
+         'logical_or': True,
+         'logical_xor': True,
+         'numel': False,
+         'rfft': False,
+         'round': False,
+         'sigmoid': False,
+         'sin': False,
+         'sinh': False,
+         'stft': False,
+         'tan': False,
+         'tanh': False,
+         'trunc': False,
+         }
+
+# Register all homogeneous functions as functions on stensors
 for fun_name, in_homs in HOMOG.items():
     torch_fun = getattr(torch, fun_name)
     assert torch_fun not in STABLE_FUNCTIONS
     stable_fun = hom_wrap(fun_name, in_homs, in_place=False)
     STABLE_FUNCTIONS[torch_fun] = stable_fun
+
+# Register simple Pytorch functions as functions on stensors
+for fun_name in TORCH:
+    torch_fun = getattr(torch, fun_name)
+    assert torch_fun not in STABLE_FUNCTIONS
+    data_only = TORCH[fun_name]
+    wrapped_fun = torch_wrap(fun_name, in_place=False, data_only=data_only)
+    STABLE_FUNCTIONS[torch_fun] = wrapped_fun
 
 # Doesn't make sense with stensors, and/or method doesn't have PyTorch
 # documentation. Not implementing
@@ -315,16 +468,9 @@ DOUBTFUL = ['affine_grid_generator', 'alpha_dropout', 'adaptive_avg_pool1d',
 'topk', 'tril_indices', 'triu_indices', 'triplet_margin_loss', 'unbind', 'zeros_like', ]
 
 # Important and/or easy functions
-TORCH = ['acos', 'angle', 'asin', 'atan', 'atan2', 'cartesian_prod', 'ceil', 
-'celu', 'clamp', 'clamp_max', 'clamp_min', 'conv1d', 'conv2d', 'conv3d', 'conv_tbc', 
-'conv_transpose1d', 'conv_transpose2d', 'conv_transpose3d', 'cos', 'cosh', 'digamma', 
-'erf', 'erfc', 'erfinv', 'exp', 'expm1', 'fft', 'floor', 'frac', 'fmod', 'ifft', 
-'irfft', 'is_complex', 'is_floating_point', 'is_nonzero', 'is_same_size', 'kthvalue', 
-'lerp', 'lgamma', 'logdet', 'numel', 'rfft', 
-'round', 'sigmoid', 'sin', 'sinh', 'stft', 'tan', 'tanh', 'trunc', ]
 DO_NOW = ['add', 'cumsum', 'dist', 'einsum', 'eq', 'ne', 'equal', 'ge', 'gt', 'le', 'lt', 
-'log', 'log10', 'log1p', 'log2', 'logical_and', 'logical_not', 'logical_or', 'logical_xor', 
-'max', 'min', 'prod', 'sign', 'sqrt', 'rsqrt', 'isfinite', 'isinf', 'isnan', ]
+'log', 'log10', 'log1p', 'log2', 'max', 'min', 'prod', 'sign', 'sqrt', 'rsqrt', 
+'isfinite', 'isinf', 'isnan', ]
 
 # Somewhat important and/or trickier functions
 DO_SOON = ['allclose', 'all', 'any', 'argmax', 'argmin', 'argsort', 
@@ -346,7 +492,7 @@ LATER = ['addbmm', 'addcdiv', 'addcmul', 'addmm', 'addmv', 'addr',
 'chunk', 'clone', 'combinations', 'cummax', 'cummin', 'diag_embed', 'diagflat', 
 'full_like', 'narrow', 'orgqr', 'ormqr', 'roll', 'slogdet', 'where', ]
 
-ALL_FUN = list(HOMOG.keys()) + DOUBTFUL + TORCH + DO_NOW + DO_SOON + LATER
+ALL_FUN = list(HOMOG.keys()) + DOUBTFUL + list(TORCH) + DO_NOW + DO_SOON + LATER
 
 ### Register stabilized Pytorch functions as methods for stensors ###
 
@@ -360,8 +506,13 @@ EXISTING_METHOD = ['abs', 'bmm', 'conj', 'cross', 'div', 'dot', 'ger', 'inverse'
 'logdet', 'logical_and', 'logical_not', 'logical_or', 'logical_xor', 'numel', 
 'rfft', 'round', 'sigmoid', 'sin', 'sinh', 'stft', 'tan', 'tanh', 'trunc']
 
-HOM_INPLACE = ['abs_', 'div_', 'mul_', 'reciprocal_', 'relu_', 'square_', 't_', 
-'true_divide_']
+HOM_INPLACE = ['abs_', 'div_', 'mul_', 'reciprocal_', 'relu_', 'square_', 
+               't_', 'true_divide_']
+
+TORCH_INPLACE = ['acos_', 'asin_', 'atan2_', 'atan_', 'clamp_', 'clamp_max_', 
+'clamp_min_', 'cos_', 'cosh_', 'digamma_', 'erf_', 'erfc_', 'erfinv_', 'exp_', 'expm1_', 
+'fmod_', 'frac_', 'lerp_', 'lgamma_', 'sigmoid_', 'sin_', 'sinh_', 'tan_', 
+'tanh_', 'trunc_', 'ceil_', 'floor_', 'round_', ]
 
 # Add all methods which I've already implement as stable functions
 for name in EXISTING_METHOD:
@@ -371,10 +522,9 @@ for name in EXISTING_METHOD:
 for name in HOM_INPLACE:
     inplace_hom_method_from_name(name)
 
-TORCH_INPLACE = ['acos_', 'asin_', 'atan2_', 'atan_', 'ceil_', 'clamp_', 'clamp_max_', 
-'clamp_min_', 'cos_', 'cosh_', 'digamma_', 'erf_', 'erfc_', 'erfinv_', 'exp_', 'expm1_', 
-'floor_', 'fmod_', 'frac_', 'lerp_', 'lgamma_', 'round_', 'sigmoid_', 'sin_', 
-'sinh_', 'tan_', 'tanh_', 'trunc_']
+# Implement in-place versions of simple torch functions
+for name in TORCH_INPLACE:
+    inplace_torch_method_from_name(name)
 
 ATTRIBUTES = ['T', '__abs__', '__add__', '__and__' ,'__array__', '__array_priority__', 
 '__array_wrap__', '__bool__', '__contains__', '__deepcopy__', '__delitem__', 
@@ -440,7 +590,7 @@ ATTRIBUTES = ['T', '__abs__', '__add__', '__and__' ,'__array__', '__array_priori
 'transpose_', 'triangular_solve', 'tril', 'tril_', 'triu', 'triu_', 'true_divide', 
 'true_divide_', 'trunc', 'trunc_', 'type', 'type_as', 'unbind', 'unflatten', 'unfold', 
 'uniform_', 'unique', 'unique_consecutive', 'unsqueeze', 'unsqueeze_', 'values', 'var', 
-'view', 'view_as', 'where', 'zero_']
+'view', 'view_as', 'where', 'zero_', ]
 
 
 ### TODOS ###
@@ -449,14 +599,12 @@ ATTRIBUTES = ['T', '__abs__', '__add__', '__and__' ,'__array__', '__array_priori
 
 
 if __name__ == '__main__':
-    # mat = stensor(torch.randn(200, 200), 0)
-    # print(dir(mat))
+    mat = stensor(100*torch.randn(5, 5), 0)
     # mat.scale *= 150
-    # print(mat.scale)
-    # print(torch.norm(mat.data))
-    # mat = mat.matmul(mat)
-    # print(mat.scale)
-    # print(torch.norm(mat.data))
+    # print(mat)
+    # mat.round_()
+    # print(mat)
+
 
     # Get the nontrivial attributes of a Pytorch tensor
     class Objer:
@@ -464,9 +612,10 @@ if __name__ == '__main__':
             pass
     obj = Objer()
     tens_atts = [f for f in dir(torch.ones(2)) if f not in dir(obj)]
+    stens_atts = [f for f in dir(stensor(torch.ones(2), 0)) if f not in dir(obj)]
     hom_atts = [f for f in tens_atts if f in HOMOG]
     torch_atts = [f for f in tens_atts if f in TORCH]
-    other_atts = [f for f in tens_atts if f not in EXISTING_METHOD+HOM_INPLACE+TORCH_INPLACE]
+    other_atts = [f for f in tens_atts if f not in stens_atts]
     # print(other_atts)
 
 
@@ -474,7 +623,7 @@ if __name__ == '__main__':
     func_dict = torch._overrides.get_overridable_functions()
     fun_names = [f.__name__ for f in func_dict[torch]]
     for name in fun_names:
-        if all(name not in big_set for big_set in [HOMOG.keys(), DOUBTFUL, TORCH, DO_NOW, DO_SOON, LATER]):
+        if all(name not in big_set for big_set in [HOMOG, DOUBTFUL, TORCH, DO_NOW, DO_SOON, LATER]):
             assert False, name
 
     # import inspect
