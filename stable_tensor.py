@@ -70,7 +70,7 @@ class STensor:
         # Slap a disclaimer on any questionable printed values
         disclaimer = ("\ninf and/or zero entries may be artifact of conversion"
                       "\nto non-stable tensor, use repr to view underlying data")
-        t = self.as_tensor()
+        t = self.to_tensor()
         # Don't slap a disclaimer on normal printed values
         if (torch.any(t != 0) or torch.all(self.data == 0)) \
                             and torch.all(torch.isfinite(t)):
@@ -134,7 +134,7 @@ class STensor:
         return STensor(self.data*(2**log_shift), 
                        self.scale-log_shift.view_as(self.scale))
 
-    def as_tensor(self):
+    def to_tensor(self):
         """Return destabilized Tensor version of STensor"""
         long_shape = self.batch_shape + (1,)*self.num_data
         return self.data * 2**self.scale.view(long_shape)
@@ -175,6 +175,8 @@ def hom_wrap(torch_fun, in_homs, out_homs):
         out_homs:  List of tuples of the same format as in_homs giving
                    homogeneity info for the outputs of torch_fun
     """
+    # TODO: Simplify implementation to not need out_homs (only used for var_mean)
+    #       
     # Handle case of homogeneous input _region_
     if in_homs[-1][0] < 0:
         # Negative indices -n in last entry of in_homs means that 
@@ -236,159 +238,136 @@ def hom_wrap(torch_fun, in_homs, out_homs):
 
 ### Re-registration of the Pytorch library as stable functions ###
 
-HOMOG = {'abs': ([()], [()]),
-         'abs_': ([()], [()]),
-         'bmm': ([()], [()]),
-         'cartesian_prod': ([()], [()]),
-         'conj': ([()], [()]),
-         'cosine_similarity': ([()], [()]),
-         'cross': ([()], [()]), 
-         'div': ([()], [()]),
-         'dot': ([()], [()]),
-         'eig': ([()], [()]),
-         'ger': ([()], [()]),
-         'imag': ([()], [()]),
-         'real': ([()], [()]),
-         'inverse': ([()], [()]),
-         'lstsq': ([()], [()]),
-         'lu': ([()], [()]),
-         'lu_solve': ([()], [()]),
-         'matmul': ([()], [()]), 
-         'mm': ([()], [()]),
-         'mode': ([()], [()]),
-         'mul': ([()], [()]),
-         'mv': ([()], [()]),
-         'pdist': ([()], [()]),
-         'pinverse': ([()], [()]),
-         'qr': ([()], [()]),
-         'reciprocal': ([()], [()]),
-         'reciprocal_': ([()], [()]), 
-         'square': ([()], [()]),
-         'square_': ([()], [()]),
-         'stack': ([()], [()]),
-         'std': ([()], [()]),
-         'std_mean': ([()], [()]),
-         'svd': ([()], [()]),
-         'sum': ([()], [()]),
-         'symeig': ([()], [()]),
-         't': ([()], [()]),
-         'take': ([()], [()]), 
-         'svd_lowrank': ([()], [()]),
-         'tensordot': ([()], [()]),
-         'trace': ([()], [()]),
-         'transpose': ([()], [()]),
-         'triangular_solve': ([()], [()]),
-         'solve': ([()], [()]), 
-         'tril': ([()], [()]),
-         'triu': ([()], [()]),
-         'trapz': ([()], [()]),
-         'true_divide': ([()], [()]),
-         'unique': ([()], [()]),
-         'unique_consecutive': ([()], [()]), 
-         'var_mean': ([()], [()]),
-         'var': ([()], [()]), 
+HOMOG = {'abs': ([(0, 1)], [(0, 1)]),
+         'bmm': ([(0, 1), (1, 1)], [(0, 1)]),
+         'conj': ([(0, 1)], [(0, 1)]),
+         'cosine_similarity': ([(0, 0), (1, 0)], [(0, 0)]),
+         'cross': ([(0, 1), (1, 1)], [(0, 1)]),
+         'div': ([(0, 1), (1, -1)], [(0, 1)]),
+         'dot': ([(0, 1), (1, 1)], [(0, 1)]),
+         'ger': ([(0, 1), (1, 1)], [(0, 1)]),
+         'imag': ([(0, 1)], [(0, 1)]),
+         'real': ([(0, 1)], [(0, 1)]),
+         'inverse': ([(0, -1)], [(0, 1)]),
+         'matmul': ([(0, 1), (1, 1)], [(0, 1)]),
+         'mm': ([(0, 1), (1, 1)], [(0, 1)]),
+         'mode': ([(0, 1)], [(0, 1)]),
+         'mul': ([(0, 1), (1, 1)], [(0, 1)]),
+         'mv': ([(0, 1), (1, 1)], [(0, 1)]),
+         'pinverse': ([(0, -1)], [(0, 1)]),
+         'reciprocal': ([(0, -1)], [(0, 1)]),
+         'relu': ([(0, 1)], [(0, 1)]),
+         'square': ([(0, 2)], [(0, 1)]),
+         'std': ([(0, 1)], [(0, 1)]),
+         'sum': ([(0, 1)], [(0, 1)]),
+         't': ([(0, 1)], [(0, 1)]),
+         'tensordot': ([(0, 1), (1, 1)], [(0, 1)]),
+         'trace': ([(0, 1)], [(0, 1)]),
+         'transpose': ([(0, 1)], [(0, 1)]),
+         'tril': ([(0, 1)], [(0, 1)]),
+         'triu': ([(0, 1)], [(0, 1)]),
+         'true_divide': ([(0, -1)], [(0, 1)]),
+         'var': ([(0, 2)], [(0, 1)]),
          }
 
-# # Register all homogeneous functions as possible functions on stensors
-# for fun_name, value in HOMOG.items():
-#     in_homs, out_homs = value
-#     wrapper = functools.partial(hom_wrap, in_homs=in_homs, out_homs=out_homs)
-#     register_from_name(fun_name, wrapper)
+# Register all homogeneous functions as possible functions on stensors
+for fun_name, value in HOMOG.items():
+    in_homs, out_homs = value
+    wrapper = functools.partial(hom_wrap, in_homs=in_homs, out_homs=out_homs)
+    register_from_name(fun_name, wrapper)
 
 # Doesn't make sense with stensors, and/or method doesn't have PyTorch
 # documentation. Not implementing
-DOUBTFUL = ['affine_grid_generator', 'align_tensors', 'alpha_dropout', 
-'alpha_dropout_', 'adaptive_avg_pool1d', 'adaptive_max_pool1d', 'arange', 
-'as_strided', 'as_strided_', 'avg_pool1d', 'bartlett_window', 'batch_norm', 
+DOUBTFUL = ['affine_grid_generator', 'alpha_dropout', 'adaptive_avg_pool1d', 
+'adaptive_max_pool1d', 'avg_pool1d', 'batch_norm', 
 'batch_norm_backward_elemt', 'batch_norm_backward_reduce', 'batch_norm_elemt', 
 'batch_norm_gather_stats', 'batch_norm_gather_stats_with_counts', 'batch_norm_stats', 
 'batch_norm_update_stats', 'bernoulli', 'bilinear', 'binary_cross_entropy_with_logits', 
-'bincount', 'bitwise_and', 'bitwise_not', 'bitwise_or', 'bitwise_xor', 
-'blackman_window', 'can_cast', 'compiled_with_cxx11_abi', 'constant_pad_nd', 
-'convolution', 'cosine_embedding_loss', 'ctc_loss', 'cudnn_affine_grid_generator', 
-'cudnn_batch_norm', 'cudnn_convolution', 'cudnn_convolution_transpose', 
-'cudnn_grid_sampler', 'cudnn_is_acceptable', 'dequantize', 'dropout', 'dropout_', 
-'dsmm', 'embedding', 'embedding_bag', 'embedding_renorm_', 'empty', 'empty_like', 
-'empty_strided', 'enable_grad', 'eye', 'fake_quantize_per_channel_affine', 
+'bincount', 'bitwise_and', 'bitwise_not', 'bitwise_or', 'bitwise_xor', 'constant_pad_nd', 
+'convolution', 'cosine_embedding_loss', 'ctc_loss', 'dequantize', 'dropout', 
+'dsmm', 'embedding', 'embedding_bag', 'empty_like', 'fake_quantize_per_channel_affine', 
 'fake_quantize_per_tensor_affine', 'fbgemm_linear_fp16_weight', 
 'fbgemm_linear_fp16_weight_fp32_activation', 'fbgemm_linear_int8_weight', 
 'fbgemm_linear_int8_weight_fp32_activation', 'fbgemm_linear_quantize_weight', 
 'fbgemm_pack_gemm_matrix_fp16', 'fbgemm_pack_quantized_matrix', 
-'feature_alpha_dropout', 'feature_alpha_dropout_', 'feature_dropout', 
-'feature_dropout_', 'fill_', 'finfo', 'fork', 'frobenius_norm', 'from_file', 
-'from_numpy', 'geqrf', 'get_default_dtype', 'get_device', 'get_file_path', 
-'get_num_interop_threads', 'get_num_threads', 'get_rng_state', 'grid_sampler', 
+'feature_alpha_dropout', 'feature_dropout', 'frobenius_norm', 'geqrf', 'grid_sampler', 
 'grid_sampler_2d', 'grid_sampler_3d', 'group_norm', 'gru', 'gru_cell', 
-'hamming_window', 'hann_window', 'hardshrink', 'hinge_embedding_loss', 'histc', 
-'hsmm', 'hspmm', 'iinfo', 'import_ir_module', 'import_ir_module_from_buffer', 
-'index_add', 'index_copy', 'index_fill', 'index_put', 'index_put_', 'index_select', 
-'initial_seed', 'instance_norm', 'int_repr', 'is_anomaly_enabled', 'is_distributed', 
-'is_signed', 'is_storage', 'isclose', 'kl_div', 'layer_norm', 'layout', 'linspace', 
-'load', 'lobpcg', 'log_softmax', 'logspace', 'lstm', 'lstm_cell', 'lu_unpack', 
-'manual_seed', 'margin_ranking_loss', 'masked_fill', 'masked_scatter', 
+'hardshrink', 'hinge_embedding_loss', 'histc', 'hsmm', 'hspmm',
+'index_add', 'index_copy', 'index_fill', 'index_put', 'index_select', 
+'instance_norm', 'int_repr', 'is_distributed', 
+'is_signed', 'isclose', 'kl_div', 'layer_norm', 
+'lobpcg', 'log_softmax', 'lstm', 'lstm_cell', 
+'margin_ranking_loss', 'masked_fill', 'masked_scatter', 
 'masked_select', 'matrix_rank', 'max_pool1d', 'max_pool1d_with_indices', 
-'max_pool2d', 'max_pool3d', 'memory_format', 'merge_type_from_type_comment', 
+'max_pool2d', 'max_pool3d', 
 'meshgrid', 'miopen_batch_norm', 'miopen_convolution', 'miopen_convolution_transpose', 
-'miopen_depthwise_convolution', 'miopen_rnn', 'mkldnn_adaptive_avg_pool2d', 
-'mkldnn_convolution', 'mkldnn_convolution_backward_weights', 'mkldnn_max_pool2d', 
+'miopen_depthwise_convolution', 'miopen_rnn', 
 'multinomial', 'mvlgamma', 'native_batch_norm', 'native_layer_norm', 'native_norm', 
-'neg', 'neg_', 'no_grad', 'nonzero', 'norm', 'norm_except_dim', 'normal', 
-'nuclear_norm', 'ones', 'ones_like', 'pairwise_distance', 'parse_ir', 'parse_schema', 
-'parse_type_comment', 'pixel_shuffle', 'poisson', 'poisson_nll_loss', 'polygamma', 
-'prelu', 'prepare_multiprocessing_environment', 'promote_types', 'q_per_channel_axis', 
+'neg', 'nonzero', 'norm', 'norm_except_dim', 'normal', 'nuclear_norm', 'ones_like', 
+'pairwise_distance', 'pixel_shuffle', 'poisson', 'poisson_nll_loss', 'polygamma', 
+'prelu', 'q_per_channel_axis', 
 'q_per_channel_scales', 'q_per_channel_zero_points', 'q_scale', 'q_zero_point', 
-'qscheme', 'quantize_per_channel', 'quantize_per_tensor', 'quantized_batch_norm', 
+'quantize_per_channel', 'quantize_per_tensor', 'quantized_batch_norm', 
 'quantized_gru', 'quantized_gru_cell', 'quantized_lstm', 'quantized_lstm_cell', 
 'quantized_max_pool2d', 'quantized_rnn_relu_cell', 'quantized_rnn_tanh_cell', 
-'rand', 'rand_like', 'randint', 'randint_like', 'randn', 'randn_like', 'randperm', 
-'range', 'relu', 'relu_', 'remainder', 'renorm', 'repeat_interleave', 'result_type', 
-'rnn_relu', 'rnn_relu_cell', 'rnn_tanh', 'rnn_tanh_cell', 'rot90', 'rrelu', 'rrelu_', 
-'rsub', 'saddmm', 'save', 'scalar_tensor', 'scatter', 'scatter_add', 'seed', 'select', 
-'selu', 'selu_', 'set_anomaly_enabled', 'set_default_dtype', 'set_default_tensor_type', 
-'set_flush_denormal', 'set_grad_enabled', 'set_num_interop_threads', 'set_num_threads', 
-'set_printoptions', 'set_rng_state', 'smm', 'softmax', 'sparse_coo_tensor', 
-'split_with_sizes', 'spmm', 'sspaddmm', 'sub', 'tensor', 'threshold', 'threshold_', 
-'topk', 'tril_indices', 'triu_indices', 'triplet_margin_loss', 'typename', 'unbind', 
-'wait', 'zero_', 'zeros', 'zeros_like', ]
+'rand_like', 'randint_like', 'randn_like', 
+'remainder', 'renorm', 'repeat_interleave', 'result_type', 
+'rnn_relu', 'rnn_relu_cell', 'rnn_tanh', 'rnn_tanh_cell', 'rot90', 'rrelu', 
+'rsub', 'saddmm', 'scalar_tensor', 'scatter', 'scatter_add', 'select', 
+'selu', 'smm', 'softmax', 'split_with_sizes', 'spmm', 'sspaddmm', 'sub', 'threshold', 
+'topk', 'tril_indices', 'triu_indices', 'triplet_margin_loss', 'unbind', 'zeros_like', ]
 
 # Important and/or easy functions
-TORCH = ['acos', 'acos_', 'angle', 'asin', 'asin_', 'atan', 'atan2', 'atan_', 
-'ceil', 'ceil_', 'celu', 'celu_', 'clamp', 'clamp_', 'clamp_max', 'clamp_max_', 
-'clamp_min', 'clamp_min_', 'conv1d', 'conv2d', 'conv3d', 'conv_tbc', 'conv_transpose1d', 
-'conv_transpose2d', 'conv_transpose3d', 'cos', 'cos_', 'cosh', 'cosh_', 'digamma', 
-'erf', 'erf_', 'erfc', 'erfc_', 'erfinv', 'exp', 'exp_', 'expm1', 'expm1_', 'fft', 
-'floor', 'floor_', 'frac', 'frac_', 'fmod', 'ifft', 'irfft', 'is_complex', 
-'is_floating_point', 'is_grad_enabled', 'is_nonzero', 'is_same_size', 'is_tensor', 
+TORCH = ['acos', 'angle', 'asin', 'atan', 'atan2', 'cartesian_prod', 'ceil', 
+'celu', 'clamp', 'clamp_max', 'clamp_min', 'conv1d', 'conv2d', 'conv3d', 'conv_tbc', 
+'conv_transpose1d', 'conv_transpose2d', 'conv_transpose3d', 'cos', 'cosh', 'digamma', 
+'erf', 'erfc', 'erfinv', 'exp', 'expm1', 'fft', 'floor', 'frac', 'fmod', 'ifft', 
+'irfft', 'is_complex', 'is_floating_point', 'is_nonzero', 'is_same_size', 
 'isfinite', 'isinf', 'isnan', 'kthvalue', 'lerp', 'lgamma', 'logdet', 'logical_and', 
-'logical_not', 'logical_or', 'logical_xor', 'numel', 'pca_lowrank', 'rfft', 
-'round', 'round_', 'sigmoid', 'sigmoid_', 'sin', 'sin_', 'sinh', 'sinh_', 'stft', 
-'tan', 'tan_', 'tanh', 'tanh_', 'trunc', 'trunc_', ]
+'logical_not', 'logical_or', 'logical_xor', 'numel', 'rfft', 
+'round', 'sigmoid', 'sin', 'sinh', 'stft', 'tan', 'tanh', 'trunc', ]
 DO_NOW = ['add', 'cumsum', 'dist', 'einsum', 'eq', 'ne', 'equal', 'ge', 'gt', 'le', 'lt', 
-'log', 'log10', 'log10_', 'log1p', 'log1p_', 'log2', 'log2_', 'log_', 'max', 'min', 
-'prod', 'sign', 'sqrt', 'sqrt_', 'rsqrt', 'rsqrt_', ]
+'log', 'log10', 'log1p', 'log2', 'max', 'min', 
+'prod', 'sign', 'sqrt', 'rsqrt', ]
 
 # Somewhat important and/or trickier functions
-DO_SOON = ['allclose', 'all', 'any', 'argmax', 'argmin', 'argsort', 'as_tensor', 
-'broadcast_tensors', '***broadcast_batch***', '***broadcast_data***', 'cat', 
-'chain_matmul', 'cumprod', 'det', 'detach', 'detach_', 'device', 'diag', 'diagonal', 
-'dtype', 'flatten', 'flip', 'floor_divide', 'gather', 'logsumexp', 'matrix_power', 
-'mean', 'median', 'pow', 'reshape', 'resize_as_', 'squeeze', 'unsqueeze', 'sort', 'split', ]
+DO_SOON = ['allclose', 'all', 'any', 'argmax', 'argmin', 'argsort', 
+'broadcast_tensors', '***broadcast_batch***', '***broadcast_data***', 
+'cat', 'stack', 'chain_matmul', 'cumprod', 'det', 'detach', 'diag', 'diagonal', 
+'flatten', 'flip', 'floor_divide', 'gather', 'logsumexp', 'matrix_power', 
+'mean', 'median', 'pow', 'reshape', 'squeeze', 'unsqueeze', 'sort', 'split', 
+# Homogeneous functions that for one reason or another can't be handled by hom_wrap
+'pdist', 'trapz', 'take', 'unique_consecutive', 'var_mean', 'lu_solve', 'std_mean', 
+# Matrix decompositions whose return types must be respected
+'qr', 'eig', 'lstsq', 'svd', 'symeig', 'triangular_solve', 'solve']
 # ***broadcast_{batch,data}***: Functions which only broadcast a subset of the indices,
 #                               I believe with no restriction on the other subset
 
 # Not important, could be tough
-LATER = ['addbmm', 'addcdiv', 'addcmul', 'addmm', 'addmv', 'addmv_', 'addr', 
+LATER = ['addbmm', 'addcdiv', 'addcmul', 'addmm', 'addmv', 'addr', 
 'baddbmm', 'cdist', 'cholesky', 'cholesky_inverse', 'cholesky_solve', 
 'chunk', 'clone', 'combinations', 'cummax', 'cummin', 'diag_embed', 'diagflat', 
-'full', 'full_like', 'narrow', 'orgqr', 'ormqr', 'roll', 'slogdet', 'where', ]
+'full_like', 'narrow', 'orgqr', 'ormqr', 'roll', 'slogdet', 'where', ]
 
 if __name__ == '__main__':
     # m = stensor(torch.ones((5,2,2)), 1)
     # v = stensor(torch.ones((5,2,3)), 1)
-    # homifier = functools.partial(hom_wrap, in_homs=((0, 1), (1, 1)), 
-    #                                        out_homs=((0, 1),))
-    # register_from_name('bmm', homifier)
     # mv = torch.bmm(m, v)
-    # print(mv)
+    mat = stensor(1024*torch.eye(5), 0)
+    print(repr(torch.pinverse(mat)))
 
-    
+
+    # Make sure there aren't functions which can be overwridden but don't appear above
+    func_dict = torch._overrides.get_overridable_functions()
+    fun_names = [f.__name__ for f in func_dict[torch]]
+    for name in fun_names:
+        if all(name not in big_set for big_set in [HOMOG.keys(), DOUBTFUL, TORCH, DO_NOW, DO_SOON, LATER]):
+            assert False, name
+
+    # import inspect
+    # override_dict = torch._overrides.get_testing_overrides()
+    # for fun_name in HOMOG:
+    #     if HOMOG[fun_name][0][0] != () and HOMOG[fun_name][1][0] != ():
+    #         continue
+    #     dummy_fun = override_dict[getattr(torch, fun_name)]
+    #     print(f"{fun_name}: {inspect.signature(dummy_fun)}")
