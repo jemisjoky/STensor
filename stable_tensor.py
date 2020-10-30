@@ -2,8 +2,6 @@ import functools
 
 import torch
 
-# from stable_funs import STABLE_FUNCTIONS
-
 # Function giving the target one-norm of a STensor based on its shape.
 # TARGET_SCALE is a sort of module-wise hyperparameter whose choice
 # influences the stability of operations on STensor instances
@@ -21,14 +19,14 @@ def TARGET_SCALE(shape, nb):
 
 ### STensor core tools ###
 
-def stensor(data, part_idx, dtype=None, device=None, requires_grad=False, pin_memory=False):
+def stensor(data, num_batch, dtype=None, device=None, requires_grad=False, pin_memory=False):
     """
     Constructs a STensor from input data and a partition index placement
 
     Args:
         data: Initial data for the stensor. Can be a list, tuple,
             NumPy ``ndarray``, scalar, and other types.
-        part_idx: Location of partition of data axes separating 
+        num_batch: Location of partition of data axes separating 
             batch axes and data axes, with negative values counted 
             from end of data tensor
         dtype (optional): the desired data type of returned tensor.
@@ -51,7 +49,7 @@ def stensor(data, part_idx, dtype=None, device=None, requires_grad=False, pin_me
 
     # Initialize with trivial scale tensor
     d_shape = data.shape
-    b_shape = d_shape[:part_idx]
+    b_shape = d_shape[:num_batch]
     scale = torch.zeros(b_shape, requires_grad=data.requires_grad, 
                         dtype=data.dtype, layout=data.layout, device=data.device)
 
@@ -68,8 +66,20 @@ class STensor:
         self.data = data
         self.scale = scale
 
+    def __str__(self):
+        # Slap a disclaimer on any questionable printed values
+        disclaimer = ("\ninf and/or zero entries may be artifact of conversion"
+                      "\nto non-stable tensor, use repr to view underlying data")
+        t = self.as_tensor()
+        # Don't slap a disclaimer on normal printed values
+        if (torch.any(t != 0) or torch.all(self.data == 0)) \
+                            and torch.all(torch.isfinite(t)):
+            disclaimer = ""
+        # return f"STensor(\n{t}){disclaimer}"
+        return f"stable\n{t}{disclaimer}"
+
     def __repr__(self):
-        return f"STensor(tensor={self.data},\nscale={self.scale})"
+        return f"STensor(data=\n{self.data}, scale=\n{self.scale})"
 
     @property
     def shape(self):
@@ -93,21 +103,34 @@ class STensor:
 
     def rescale_(self):
         """In-place rescaling method"""
+        # Get the L1 norm of data and scale correction for each fiber
         nb, nt = self.num_batch, len(self.shape)
         tens_scale = torch.sum(self.data.abs(), dim=list(range(nb, nt)), 
                                 keepdim=True)
         log_shift = torch.floor(TARGET_SCALE(self.shape, nb) - 
                                 torch.log2(tens_scale))
+
+        # Keep the scale for zero fibers unchanged
+        if torch.any(torch.isinf(log_shift)):
+            log_shift = torch.where(torch.isfinite(log_shift), log_shift,
+                                    torch.zeros_like(log_shift))
+
         self.data *= 2**log_shift
         self.scale -= log_shift.view_as(self.scale)
 
     def rescale(self):
         """Return STensor with rescaled data"""
+        # Get the L1 norm of data and scale correction for each fiber
         nb, nt = self.num_batch, len(self.shape)
         tens_scale = torch.sum(self.data.abs(), dim=list(range(nb, nt)), 
                                 keepdim=True)
         log_shift = torch.floor(TARGET_SCALE(self.shape, nb) - 
                                 torch.log2(tens_scale))
+
+        # Keep the scale for zero fibers unchanged
+        if torch.any(torch.isinf(log_shift)):
+            log_shift = torch.where(torch.isfinite(log_shift), log_shift,
+                                    torch.zeros_like(log_shift))
         return STensor(self.data*(2**log_shift), 
                        self.scale-log_shift.view_as(self.scale))
 
@@ -119,22 +142,25 @@ class STensor:
     def __torch_function__(self, fun, types, args=(), kwargs=None):
         if kwargs is None:
             kwargs = {}
-        type_cond = all(issubclass(t, (torch.Tensor,STensor)) 
-                                    for t in types)
+        type_cond = all(issubclass(t, (torch.Tensor,STensor)) for t in types)
         if fun in STABLE_FUNCTIONS and type_cond:
             return STABLE_FUNCTIONS[fun](*args, **kwargs)
         else:
             return NotImplemented
 
 
-### Pytorch functions on STensors ###
+### Wrappers for converting Pytorch functions to ones on STensors ###
 
-def ensure_stensor(inp):
-    """Convert an input into STensor, if needed"""
-    if isinstance(inp, STensor):
-        return inp
-    else:
-        return stensor(inp)
+# Dictionary to store reimplemented Pytorch functions for use on stensors
+STABLE_FUNCTIONS = {}
+
+def register_from_name(fun_name, wrapper):
+    """Use torch function name and wrapper to register stabilized function"""
+    global STABLE_FUNCTIONS
+    torch_fun = getattr(torch, fun_name)
+    assert torch_fun not in STABLE_FUNCTIONS
+    stable_fun = wrapper(torch_fun)
+    STABLE_FUNCTIONS[torch_fun] = stable_fun
 
 def hom_wrap(torch_fun, in_homs, out_homs):
     """
@@ -151,7 +177,7 @@ def hom_wrap(torch_fun, in_homs, out_homs):
     """
     # Handle case of homogeneous input _region_
     if in_homs[-1][0] < 0:
-        # Negative indices of -n in last entry of in_homs denotes that 
+        # Negative indices -n in last entry of in_homs means that 
         # (n-1)th and future entries to torch_fun are homogeneous
         in_regs = True
         reg_start, reg_deg = in_homs.pop()
@@ -159,34 +185,37 @@ def hom_wrap(torch_fun, in_homs, out_homs):
     else:
         in_regs = False
 
-    # Reinterpret in_homs as dictionary
+    # Reinterpret in_homs, out_homs as dictionaries
     in_homs = {idx: deg for idx, deg in in_homs}
-
-    # Reinterpret out_homs as dictionary
     out_homs = {idx: deg for idx, deg in out_homs}
+
+    # Function for checking if an argument index is homogeneous
+    hom_ind = lambda i: i in in_homs or (in_regs and i >= reg_start)
 
     @functools.wraps(torch_fun)
     def stable_fun(*args, **kwargs):
-        # TODO: Extract reference batch shape from input
-        
-        # Process input arguments, extract homogeneous positional args
+        # TODO: Do shape inference to be able to handle non-stensor inputs
+        # for homogeneous args, warn when there's ambiguity
+
+        # Separate out homogeneous args and put everything in all_args
         all_args, in_scales = [], []
         for i, t in enumerate(args):
-            if i in in_homs or (in_regs and i >= reg_start):
-
+            if hom_ind(i):
                 # Homogeneous input args
-                t = ensure_stensor(t)
+                if not isinstance(t, STensor):
+                    breakpoint()
+                    raise ValueError(f"Input argument {i} to stable version"
+                                    f" {torch_fun.__name__} must be an STensor")
                 all_args.append(t.data)
                 deg = reg_deg if in_regs and i>=reg_start else in_homs[i]
                 in_scales.append(deg * t.scale)
-
             else:
                 # Nonhomogeneous input args
                 all_args.append(t)
 
         # Compute overall rescaling associated with input tensors
         if len(in_scales) > 1:
-            out_scale = sum(torch.broadcast_tensors(in_scales))
+            out_scale = sum(torch.broadcast_tensors(*in_scales))
         else:
             out_scale = in_scales.pop()
 
@@ -201,11 +230,70 @@ def hom_wrap(torch_fun, in_homs, out_homs):
                 stens.rescale_()
                 output[i] = stens
 
-        return tuple(output)
+        return tuple(output) if len(output) > 1 else output[0]
 
     return stable_fun
 
+### Re-registration of the Pytorch library as stable functions ###
 
+HOMOG = {'abs': ([()], [()]),
+         'abs_': ([()], [()]),
+         'bmm': ([()], [()]),
+         'cartesian_prod': ([()], [()]),
+         'conj': ([()], [()]),
+         'cosine_similarity': ([()], [()]),
+         'cross': ([()], [()]), 
+         'div': ([()], [()]),
+         'dot': ([()], [()]),
+         'eig': ([()], [()]),
+         'ger': ([()], [()]),
+         'imag': ([()], [()]),
+         'real': ([()], [()]),
+         'inverse': ([()], [()]),
+         'lstsq': ([()], [()]),
+         'lu': ([()], [()]),
+         'lu_solve': ([()], [()]),
+         'matmul': ([()], [()]), 
+         'mm': ([()], [()]),
+         'mode': ([()], [()]),
+         'mul': ([()], [()]),
+         'mv': ([()], [()]),
+         'pdist': ([()], [()]),
+         'pinverse': ([()], [()]),
+         'qr': ([()], [()]),
+         'reciprocal': ([()], [()]),
+         'reciprocal_': ([()], [()]), 
+         'square': ([()], [()]),
+         'square_': ([()], [()]),
+         'stack': ([()], [()]),
+         'std': ([()], [()]),
+         'std_mean': ([()], [()]),
+         'svd': ([()], [()]),
+         'sum': ([()], [()]),
+         'symeig': ([()], [()]),
+         't': ([()], [()]),
+         'take': ([()], [()]), 
+         'svd_lowrank': ([()], [()]),
+         'tensordot': ([()], [()]),
+         'trace': ([()], [()]),
+         'transpose': ([()], [()]),
+         'triangular_solve': ([()], [()]),
+         'solve': ([()], [()]), 
+         'tril': ([()], [()]),
+         'triu': ([()], [()]),
+         'trapz': ([()], [()]),
+         'true_divide': ([()], [()]),
+         'unique': ([()], [()]),
+         'unique_consecutive': ([()], [()]), 
+         'var_mean': ([()], [()]),
+         'var': ([()], [()]), 
+         }
+
+# # Register all homogeneous functions as possible functions on stensors
+# for fun_name, value in HOMOG.items():
+#     in_homs, out_homs = value
+#     wrapper = functools.partial(hom_wrap, in_homs=in_homs, out_homs=out_homs)
+#     register_from_name(fun_name, wrapper)
 
 # Doesn't make sense with stensors, and/or method doesn't have PyTorch
 # documentation. Not implementing
@@ -275,23 +363,18 @@ TORCH = ['acos', 'acos_', 'angle', 'asin', 'asin_', 'atan', 'atan2', 'atan_',
 'logical_not', 'logical_or', 'logical_xor', 'numel', 'pca_lowrank', 'rfft', 
 'round', 'round_', 'sigmoid', 'sigmoid_', 'sin', 'sin_', 'sinh', 'sinh_', 'stft', 
 'tan', 'tan_', 'tanh', 'tanh_', 'trunc', 'trunc_', ]
-HOMOG = ['abs', 'abs_', 'bmm', 'cartesian_prod', 'conj', 'cosine_similarity', 'cross', 
-'div', 'dot', 'eig', 'ger', 'imag', 'real', 'inverse', 'lstsq', 'lu', 'lu_solve', 'matmul', 
-'mm', 'mode', 'mul', 'mv', 'pdist', 'pinverse', 'qr', 'reciprocal', 'reciprocal_', 
-'square', 'square_', 'stack', 'std', 'std_mean', 'svd', 'sum', 'symeig', 't', 'take', 
-'svd_lowrank', 'tensordot', 'trace', 'transpose', 'triangular_solve', 'solve', 
-'tril', 'triu', 'trapz', 'true_divide', 'unique', 'unique_consecutive', 
-'var_mean', 'var', ]
 DO_NOW = ['add', 'cumsum', 'dist', 'einsum', 'eq', 'ne', 'equal', 'ge', 'gt', 'le', 'lt', 
 'log', 'log10', 'log10_', 'log1p', 'log1p_', 'log2', 'log2_', 'log_', 'max', 'min', 
 'prod', 'sign', 'sqrt', 'sqrt_', 'rsqrt', 'rsqrt_', ]
 
 # Somewhat important and/or trickier functions
 DO_SOON = ['allclose', 'all', 'any', 'argmax', 'argmin', 'argsort', 'as_tensor', 
-'broadcast_tensors', 'cat', 'chain_matmul', 'cumprod', 'det', 'detach', 
-'detach_', 'device', 'diag', 'diagonal', 'dtype', 'flatten', 'flip', 'floor_divide', 
-'gather', 'logsumexp', 'matrix_power', 'mean', 'median', 'pow', 'reshape', 'resize_as_', 
-'squeeze', 'unsqueeze', 'sort', 'split', ]
+'broadcast_tensors', '***broadcast_batch***', '***broadcast_data***', 'cat', 
+'chain_matmul', 'cumprod', 'det', 'detach', 'detach_', 'device', 'diag', 'diagonal', 
+'dtype', 'flatten', 'flip', 'floor_divide', 'gather', 'logsumexp', 'matrix_power', 
+'mean', 'median', 'pow', 'reshape', 'resize_as_', 'squeeze', 'unsqueeze', 'sort', 'split', ]
+# ***broadcast_{batch,data}***: Functions which only broadcast a subset of the indices,
+#                               I believe with no restriction on the other subset
 
 # Not important, could be tough
 LATER = ['addbmm', 'addcdiv', 'addcmul', 'addmm', 'addmv', 'addmv_', 'addr', 
@@ -300,7 +383,12 @@ LATER = ['addbmm', 'addcdiv', 'addcmul', 'addmm', 'addmv', 'addmv_', 'addr',
 'full', 'full_like', 'narrow', 'orgqr', 'ormqr', 'roll', 'slogdet', 'where', ]
 
 if __name__ == '__main__':
-    s_mv = hom_wrap(torch.mv, [(0, 1), (1, 1)], [(0, 1)])
-    m = torch.ones((2,2))
-    v = torch.ones((2,))
-    print(s_mv(m, v))
+    # m = stensor(torch.ones((5,2,2)), 1)
+    # v = stensor(torch.ones((5,2,3)), 1)
+    # homifier = functools.partial(hom_wrap, in_homs=((0, 1), (1, 1)), 
+    #                                        out_homs=((0, 1),))
+    # register_from_name('bmm', homifier)
+    # mv = torch.bmm(m, v)
+    # print(mv)
+
+    
