@@ -189,6 +189,10 @@ class STensor:
         # Multiplication is commutative, so __rmul__ == __mul__
         return self.mul(other)
 
+    def __imul__(self, other):
+        # In-place multiplication
+        self.mul_(other)
+
     def __add__(self, other):
         return self.add(other)
 
@@ -196,12 +200,27 @@ class STensor:
         # Addition is commutative, so __radd__ == __add__
         return self.add(other)
 
+    def __iadd__(self, other):
+        # In-place addition
+        self.add_(other)
+
+    
+
     def __abs__(self):
         return self.abs()
 
-    
+    def __getitem__(self, idx):
+        # Cases to consider are
+        #   * Pytorch tensors (advanced indexing, not handled)
+        #   * Tuples of primitive indices (pinds) or bare pinds, 
+        #     where pinds include the following cases
+        #       * integers
+        #       * slices
+        #       * None
+        #       * Ellipsis
+        raise NotImplementedError
 
-    
+
 
 def move_sdims(stens, stable_dims):
     """Return copy of input STensor with new stable dims"""
@@ -235,6 +254,47 @@ def move_sdims(stens, stable_dims):
     assert new_stens.stable_dims == stable_dims
     new_stens.rescale_()
     return new_stens
+
+def same_scale(*tensors):
+    """
+    Convert tensors into list of data tensors with a common scale tensor
+
+    Args:
+        tensors:   Any number of STensors, Pytorch Tensors, or anything 
+                   that can be converted into such datatypes. All inputs 
+                   must be jointly broadcastable
+
+    Output:
+        data_list: List of Pytorch Tensors with the same shape
+        out_scale: Tensor giving the scale of all entries of data_list
+    """
+    # For each input, pull out data tensor and, if possible, scale tensor
+    data_list, scale_list = [], []
+    for t in tensors:
+        if isinstance(t, STensor):
+            data_list.append(t.data)
+            scale_list.append(t.scale)
+        else:
+            if not isinstance(t, torch.Tensor):
+                t = torch.tensor(t)
+            data_list.append(t)
+            scale_list.append(torch.zeros((1,)*len(t.shape)))
+
+    # Broadcast data and scale tensors
+    data_list = torch.broadcast_tensors(*data_list)
+    scale_list = torch.broadcast_tensors(*scale_list)
+
+    # Get shared scale tensor, which is elementwise max of input scales
+    if len(tensors) == 2:
+        out_scale = torch.maximum(*scale_list)
+    else:
+        out_scale = functools.reduce(torch.maximum, 
+                                     scale_list[1:], scale_list[0])
+
+    # Rescale all data tensors to correspond to out_scale
+    data_list = [t * 2**(s-out_scale) for t, s in zip(data_list, scale_list)]
+
+    return tuple(data_list), out_scale
 
 def bad_conversion(stens, tensor):
     """Check if conversion to tensor led to underflow/overflow problems"""
@@ -333,10 +393,10 @@ def torch_wrap(fun_name, in_place=False, data_only=False, rescale=False):
                     unwrapped tensor
         rescale:    Whether the first two arguments should be rescaled to
                     have the same scale tensor, which is then used as
-                    a scale tensor for the output
+                    a scale tensor for the output when data_only is True
     """
-    # TODO: Deal with non-stensors as inputs
-    assert not (in_place and data_only), fun_name
+    # TODO: Refactor this to minimize all the opaque overlapping conditions
+    assert not (in_place and data_only)
     if in_place:
         torch_fun = getattr(torch.Tensor, fun_name)
     else:
@@ -349,56 +409,71 @@ def torch_wrap(fun_name, in_place=False, data_only=False, rescale=False):
             self = args[0]  # <- Object whose method is being called
             assert isinstance(self, STensor), ("Cannot call in-place torch.Tensor "
                                                "methods with STensors as input")
+
         # Rescale first two input arguments if need be
+        # NOTE: If a new method is added to SCALE_TORCH, revise this
         args = list(args)
-        if rescale: args[:2] = same_scale(args[:2])
+        if rescale:
+            data_list, out_scale = same_scale(*args[:2])
+            args[:2] = [STensor(t, out_scale) for t in data_list]
 
         # Replace any STensor args with Torch tensors
-        scale_list = []
+        data_list, scale_list = [], []
         for i, t in enumerate(args):
             if isinstance(t, STensor):
+                data_list.append(t.data if (data_only or (rescale and i<2)) 
+                                 else t.to_tensor())
                 scale_list.append(t.scale)
-                args[i] = t.data if data_only else t.to_tensor()
-        assert len(scale_list) > 0, \
-                "STensor input must appear within positional arguments"
+            else:
+                data_list.append(t)
+
+        assert len(scale_list) > 0, ("STensor input must appear within "
+                                    f"positional arguments of {fun_name}")
 
         # Compute overall rescaling associated with input tensors
-        # TODO: Find better way of doing this
-        if len(scale_list) == 1:
-            num_batch = len(scale_list[0].shape)
-        else:
-            num_batch = len(torch.broadcast_tensors(*scale_list)[0].shape)
+        if not data_only:
+            try:
+                scale_shape = torch.broadcast_tensors(*scale_list)[0].shape
+            except:
+                raise GENERIC_ERROR
 
         # Call wrapped Pytorch function, get output as list, and return.
         # Different behavior required for in-place vs regular cases
         if in_place:
+            # Update the data and scale attributes of self
+            self.data = data_list[0]
+            if rescale:
+                self.scale = scale_list[0]
+            else:
+                self.scale.zero_()
+
             # Call in-place method of data tensor, then readjust scale
-            self.data = args[0]
-            self.scale.zero_()
-            getattr(self.data, fun_name)(*args[1:], **kwargs)
+            getattr(self.data, fun_name)(*data_list[1:], **kwargs)
             self.rescale_()
         else:
             # Call Torch function with data, then convert to stensor
-            output = torch_fun(*args, **kwargs)
-            assert isinstance(output, torch.Tensor)
+            output = torch_fun(*data_list, **kwargs)
+            assert isinstance(output, torch.Tensor) or data_only
+
             if data_only:
                 return output
             else:
-                stens = stensor(output, num_batch)
+                if len(scale_shape) != len(output.shape):
+                    raise GENERIC_ERROR
+
+                if rescale:
+                    try:
+                        stens = STensor(output, out_scale)
+                    except:
+                        raise GENERIC_ERROR
+                else:
+                    stable_dims = tuple(i for i, d in enumerate(scale_shape)
+                                                if d > 1)
+                    stens = stensor(output, stable_dims)
                 stens.rescale_()
                 return stens
 
     return wrapped_fun
-
-def same_scale(stens_list):
-    """
-    Convert a list of tensors or stensors into list of stensors with same 
-    scale tensors
-    """
-    is_stensor = [isinstance(t, STensor) for t in stens_list]
-    assert any(is_stensor)
-
-
 
 def existing_method_from_name(fun_name):
     """Add method to STensor for existing stable function"""
@@ -423,7 +498,10 @@ def inplace_torch_method_from_name(fun_name):
     """Add in-place versions of simple torch function to STensor"""
     assert hasattr(torch.Tensor, fun_name)
     assert fun_name[-1] == '_'
-    data_only = TORCH[fun_name[:-1]]
+    try:
+        data_only = TORCH[fun_name[:-1]]
+    except:
+        data_only = SCALE_TORCH[fun_name[:-1]]
     wrapped_method = torch_wrap(fun_name, in_place=True, data_only=data_only)
     setattr(STensor, fun_name, wrapped_method)
 
@@ -520,10 +598,10 @@ TORCH = {'acos': False,
          }
 
 # Values give data_only flag sent to torch_wrap
+# Change torch_wrap if I add a function that doesn't take exactly 2 inputs
 SCALE_TORCH = {'add': False,
-               'sub': False, 
-               'dist': False,
-               'eq': True, 
+               'sub': False,
+               'eq': True,
                'ne': True,
                'equal': True,
                'ge': True,
@@ -541,16 +619,20 @@ for fun_name, hom_data in HOMOG.items():
     STABLE_FUNCTIONS[torch_fun] = stable_fun
 
 # Register simple Pytorch functions as functions on stensors
-for fun_name in TORCH:
+for fun_name, data_only in TORCH.items():
     torch_fun = getattr(torch, fun_name)
     assert torch_fun not in STABLE_FUNCTIONS
-    data_only = TORCH[fun_name]
-    wrapped_fun = torch_wrap(fun_name, in_place=False, data_only=data_only)
+    wrapped_fun = torch_wrap(fun_name, in_place=False, data_only=data_only,
+                                        rescale=False)
     STABLE_FUNCTIONS[torch_fun] = wrapped_fun
 
 # Register scaled Pytorch functions as functions on stensors
-for fun_name in SCALE_TORCH:
-    pass
+for fun_name, data_only in SCALE_TORCH.items():
+    torch_fun = getattr(torch, fun_name)
+    assert torch_fun not in STABLE_FUNCTIONS
+    wrapped_fun = torch_wrap(fun_name, in_place=False, data_only=data_only,
+                                        rescale=True)
+    STABLE_FUNCTIONS[torch_fun] = wrapped_fun
 
 # Doesn't make sense with stensors, and/or method doesn't have PyTorch
 # documentation. Not implementing
@@ -595,7 +677,7 @@ DO_NOW = ['einsum', 'log', 'log10', 'log2', 'max', 'min', 'sqrt', 'rsqrt', ]
 # Somewhat important and/or trickier functions
 DO_SOON = ['allclose', 'argsort', 'broadcast_tensors', 'cat', 'stack', 'chain_matmul', 
 'cumprod', 'detach', 'diag', 'diagonal', 'flatten', 'flip', 'floor_divide', 'gather', 
-'pow', 'reshape', 'squeeze', 'unsqueeze', 'sort', 'split', 
+'pow', 'reshape', 'squeeze', 'unsqueeze', 'sort', 'split', 'dist',
 # Homogeneous functions that for one reason or another can't be handled by hom_wrap
 'pdist', 'trapz', 'take', 'unique_consecutive', 'var_mean', 'lu_solve', 'std_mean', 
 'tril', 'triu', 'argmax', 'argmin', 
@@ -625,15 +707,16 @@ EXISTING_METHOD = ['abs', 'bmm', 'conj', 'cross', 'div', 'dot', 'ger', 'inverse'
 'exp', 'expm1', 'fft', 'floor', 'fmod', 'frac', 'ifft', 'irfft', 'is_complex', 
 'is_floating_point', 'is_nonzero', 'is_same_size', 'kthvalue', 'lerp', 'lgamma', 
 'logdet', 'logical_and', 'logical_not', 'logical_or', 'logical_xor', 'numel', 
-'rfft', 'round', 'sigmoid', 'sin', 'sinh', 'stft', 'tan', 'tanh', 'trunc']
+'rfft', 'round', 'sigmoid', 'sin', 'sinh', 'stft', 'tan', 'tanh', 'trunc',
+'add', 'sub', 'eq', 'ne', 'equal', 'ge', 'gt', 'le', 'lt', ]
 
 HOM_INPLACE = ['abs_', 'div_', 'mul_', 'reciprocal_', 'relu_', 'square_', 
-               't_', 'true_divide_']
+               't_', 'true_divide_', ]
 
 TORCH_INPLACE = ['acos_', 'asin_', 'atan2_', 'atan_', 'clamp_', 'clamp_max_', 
 'clamp_min_', 'cos_', 'cosh_', 'digamma_', 'erf_', 'erfc_', 'erfinv_', 'exp_', 'expm1_', 
 'fmod_', 'frac_', 'lerp_', 'lgamma_', 'sigmoid_', 'sin_', 'sinh_', 'tan_', 
-'tanh_', 'trunc_', 'ceil_', 'floor_', 'round_', ]
+'tanh_', 'trunc_', 'ceil_', 'floor_', 'round_', 'add_', 'sub_', ]
 
 # Add all methods which I've already implement as stable functions
 for name in EXISTING_METHOD:
@@ -715,19 +798,16 @@ ATTRIBUTES = ['T', '__abs__', '__add__', '__and__' ,'__array__', '__array_priori
 
 
 ### TODOS ###
-# (1)  Redo triu, tril to work with batch indices
-# (2)  Redo transpose to ensure we aren't flipping batch and data indices
 
+
+GENERIC_ERROR = NotImplementedError("Something went wrong, please let me "
+                                    "know and I will try to fix it")
 
 if __name__ == '__main__':
     mat = stensor(torch.randn(5, 5), (0,))
-    print(mat.stable_dims)
-    mat = move_sdims(mat, (0, 1))
-    print(mat)
-    print(mat * mat)
-    print(mat.to_tensor() * mat.to_tensor())
-    # mat.round_()
-    # print(mat)
+    dub1, dub2 = 2 * mat, torch.add(mat, mat)
+    print(mat + mat)
+    print(dub1 - dub2)
 
 
     # # Get the nontrivial attributes of a Pytorch tensor
@@ -741,7 +821,6 @@ if __name__ == '__main__':
     # torch_atts = [f for f in tens_atts if f in TORCH]
     # other_atts = [f for f in tens_atts if f not in stens_atts]
     # print(other_atts)
-
 
     # # Make sure there aren't functions which can be overwridden but don't appear above
     # func_dict = torch._overrides.get_overridable_functions()
