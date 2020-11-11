@@ -101,20 +101,8 @@ class STensor:
         return self.data.shape
 
     @property
-    def num_dims(self):
-        return len(self.data.shape)
-
-    # @property
-    # def batch_shape(self):
-    #     return self.scale.shape
-
-    # @property
-    # def data_shape(self):
-    #     return self.data.shape[self.num_batch:]
-
-    # @property
-    # def num_sdims(self):
-    #     return len([d for d in self.scale.shape if d > 1])
+    def ndim(self):
+        return self.data.ndim
 
     @property
     def stable_dims(self):
@@ -124,9 +112,9 @@ class STensor:
     def data_dims(self):
         return tuple(i for i, d in enumerate(self.scale.shape) if d == 1)
 
-    # @property
-    # def num_data(self):
-    #     return len(self.data.shape) - self.num_batch
+    @property
+    def T(self):
+        return STensor(self.data.T, self.scale.T)
 
     def rescale_(self):
         """In-place rescaling method"""
@@ -180,7 +168,13 @@ class STensor:
         else:
             return NotImplemented
 
-    # Magic methods
+    # The rest of the magic methods
+
+    def __pow__(self, other):
+        return STensor(self.data**other, self.scale*other).rescale()
+
+    def __matmul__(self, other):
+        return torch.matmul(self, other)
 
     def __mul__(self, other):
         return self.mul(other)
@@ -190,7 +184,6 @@ class STensor:
         return self.mul(other)
 
     def __imul__(self, other):
-        # In-place multiplication
         self.mul_(other)
 
     def __add__(self, other):
@@ -201,13 +194,74 @@ class STensor:
         return self.add(other)
 
     def __iadd__(self, other):
-        # In-place addition
         self.add_(other)
 
-    
+    def __sub__(self, other):
+        return self.sub(other)
 
+    def __rsub__(self, other):
+        return torch.sub(other, self)
+
+    def __isub__(self, other):
+        self.sub_(other)
+
+    def __div__(self, other):
+        return self.div(other)
+
+    def __rdiv__(self, other):
+        return torch.div(other, self)
+
+    def __idiv__(self, other):
+        self.div_(other)
+
+    def __neg__(self):
+        return STensor(-self.data, self.scale)
+
+    def __floordiv__(self, other):
+        return torch.floor(self.div(other))
+
+    def __rfloordiv__(self, other):
+        return torch.floor(torch.div(other, self))
+
+    def __ifloordiv__(self, other):
+        raise RuntimeError("In-place floor division doesn't really make "
+                "sense with STensors, integer precision isn't guaranteed")
+
+    # def __mod__(self, other):
+    #     pass
+    
     def __abs__(self):
         return self.abs()
+
+    def __eq__(self, other):
+        return self.eq(other)
+
+    def __gt__(self, other):
+        return self.gt(other)
+
+    def __lt__(self, other):
+        return self.lt(other)
+
+    def __ge__(self, other):
+        return self.ge(other)
+
+    def __le__(self, other):
+        return self.le(other)
+
+    def __len__(self):
+        return len(self.data)
+
+    def __contains__(self, other):
+        return self.to_tensor().__contains__(other)
+
+    def __reversed__(self):
+        return STensor(self.data.flip(0), self.scale.flip(0))
+
+    def __bool__(self):
+        return self.data.__bool__()
+
+
+    
 
     def __getitem__(self, idx):
         # Cases to consider are
@@ -225,8 +279,8 @@ class STensor:
 def move_sdims(stens, stable_dims):
     """Return copy of input STensor with new stable dims"""
     # Get the data dimensions associated with new stable dims
-    assert all(0 <= i < stens.num_dims for i in stable_dims)
-    data_dims = tuple(i for i in range(stens.num_dims) 
+    assert all(0 <= i < stens.ndim for i in stable_dims)
+    data_dims = tuple(i for i in range(stens.ndim) 
                         if i not in stable_dims)
 
     # Rescale data tensor relative to maximum of scale values, expanding 
@@ -344,7 +398,7 @@ def hom_wrap(fun_name, hom_degs, data_lens, in_place=False):
 
                     # Check that homog op is acting only on data dims, and
                     # not on stable dims
-                    nd, dd = t.num_dims, t.data_dims
+                    nd, dd = t.ndim, t.data_dims
                     if not all(j in dd for j in range(nd-data_lens[i], nd)):
                         raise ValueError(f"STensor input {i} to {fun_name} must have "
                                          f"at least {data_lens[i]} data dims, "
@@ -798,6 +852,18 @@ ATTRIBUTES = ['T', '__abs__', '__add__', '__and__' ,'__array__', '__array_priori
 
 
 ### TODOS ###
+"""
+1)  Enforce type constraint that data is always some type of float, 
+    scale is always some type of int
+
+2)  Finish getting and setting methods for indexing
+
+3)  Find elegant way of resolving issue with zero slices. These currently
+    have an arbitrary scale tensor, which could lead to some issue later.
+    Find a way of setting the scale values *really* small, something like
+    the minimum value of the integer datatype
+
+"""
 
 
 GENERIC_ERROR = NotImplementedError("Something went wrong, please let me "
@@ -806,8 +872,8 @@ GENERIC_ERROR = NotImplementedError("Something went wrong, please let me "
 if __name__ == '__main__':
     mat = stensor(torch.randn(5, 5), (0,))
     dub1, dub2 = 2 * mat, torch.add(mat, mat)
-    print(mat + mat)
-    print(dub1 - dub2)
+    print(bool(mat))
+    breakpoint()
 
 
     # # Get the nontrivial attributes of a Pytorch tensor
