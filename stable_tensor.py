@@ -166,6 +166,9 @@ class STensor:
         if fun in STABLE_FUNCTIONS and type_cond:
             return STABLE_FUNCTIONS[fun](*args, **kwargs)
         else:
+            print(f"STensor version of 'torch.{fun.__name__}' not yet "
+                  "implemented, let me know at https://github.com/jemisjoky"
+                  "/STensor/issues if you want me to prioritize this")
             return NotImplemented
 
     # The rest of the magic methods
@@ -175,6 +178,9 @@ class STensor:
 
     def __matmul__(self, other):
         return torch.matmul(self, other)
+
+    def __rmatmul__(self, other):
+        return torch.matmul(other, self)
 
     def __mul__(self, other):
         return self.mul(other)
@@ -205,13 +211,13 @@ class STensor:
     def __isub__(self, other):
         self.sub_(other)
 
-    def __div__(self, other):
+    def __truediv__(self, other):
         return self.div(other)
 
-    def __rdiv__(self, other):
+    def __rtruediv__(self, other):
         return torch.div(other, self)
 
-    def __idiv__(self, other):
+    def __itruediv__(self, other):
         self.div_(other)
 
     def __neg__(self):
@@ -529,6 +535,34 @@ def torch_wrap(fun_name, in_place=False, data_only=False, rescale=False):
 
     return wrapped_fun
 
+def minimal_wrap(new_fun):
+    """Take a single function and set it as the Torch override for STensors"""
+    fun_name = new_fun.__name__
+    assert fun_name in dir(torch)
+    torch_fun = getattr(torch, fun_name)
+    new_fun.__doc__ = torch_fun.__doc__
+    STABLE_FUNCTIONS[torch_fun] = new_fun
+    return new_fun
+
+def log_wrap(fun_name):
+    """Simple wrapper to reimplement and register logarithm functions"""
+    assert fun_name in ['log', 'log10', 'log2']
+    torch_fun = getattr(torch, fun_name)
+    base_lookup = {'log':   torch.log2(torch.exp(torch.ones(()))), 
+                   'log10': torch.log2(torch.tensor(10.)), 
+                   'log2':  torch.ones(())}
+    base_coeff = base_lookup[fun_name]
+
+    # The new logarithm function
+    @functools.wraps(torch_fun)
+    def log_fun(input, *, out=None):
+        assert isinstance(input, STensor)
+        output = torch_fun(input.data) + input.scale/base_coeff
+        return stensor(output)
+
+    # Register the new logarithm function
+    STABLE_FUNCTIONS[torch_fun] = log_fun
+
 def existing_method_from_name(fun_name):
     """Add method to STensor for existing stable function"""
     global STensor
@@ -558,6 +592,15 @@ def inplace_torch_method_from_name(fun_name):
         data_only = SCALE_TORCH[fun_name[:-1]]
     wrapped_method = torch_wrap(fun_name, in_place=True, data_only=data_only)
     setattr(STensor, fun_name, wrapped_method)
+
+### Re-implementations of individual Pytorch functions ###
+
+@minimal_wrap
+def transpose(input, dim0, dim1):
+    return STensor(torch.transpose(input.data, dim0, dim1), 
+                   torch.transpose(input.scale, dim0, dim1))
+
+
 
 ### Re-registration of the Pytorch library as stable functions ###
 
@@ -664,6 +707,8 @@ SCALE_TORCH = {'add': False,
                'lt': True,
                }
 
+LOG_FUNS = ['log', 'log10', 'log2']
+
 # Register all homogeneous functions as functions on stensors
 for fun_name, hom_data in HOMOG.items():
     hom_degs, data_lens = zip(*hom_data)
@@ -687,6 +732,10 @@ for fun_name, data_only in SCALE_TORCH.items():
     wrapped_fun = torch_wrap(fun_name, in_place=False, data_only=data_only,
                                         rescale=True)
     STABLE_FUNCTIONS[torch_fun] = wrapped_fun
+
+# Register logarithm functions as functions on stensors
+for fun_name in LOG_FUNS:
+    log_wrap(fun_name)
 
 # Doesn't make sense with stensors, and/or method doesn't have PyTorch
 # documentation. Not implementing
@@ -784,84 +833,107 @@ for name in HOM_INPLACE:
 for name in TORCH_INPLACE:
     inplace_torch_method_from_name(name)
 
-ATTRIBUTES = ['T', '__abs__', '__add__', '__and__' ,'__array__', '__array_priority__', 
-'__array_wrap__', '__bool__', '__contains__', '__deepcopy__', '__delitem__', 
-'__div__', '__float__', '__floordiv__', '__getitem__', '__iadd__', '__iand__', 
-'__idiv__', '__ifloordiv__', '__ilshift__', '__imul__', '__index__', '__int__', 
-'__invert__', '__ior__', '__ipow__', '__irshift__', '__isub__', '__iter__', 
-'__itruediv__', '__ixor__', '__len__', '__long__', '__lshift__', '__matmul__', '__mod__', 
-'__mul__', '__neg__', '__nonzero__', '__or__', '__pow__', '__radd__', '__rdiv__', 
-'__reversed__', '__rfloordiv__', '__rmul__', '__rpow__', '__rshift__', '__rsub__', 
-'__rtruediv__', '__setitem__', '__setstate__', '__sub__', '__truediv__', '__xor__', 
+ATTRIBUTES = ['T', '__abs__', '__add__', '__and__', '__array__', '__array_priority__', 
+'__array_wrap__', '__bool__', '__class__', '__complex__', '__contains__', 
+'__deepcopy__', '__delattr__', '__delitem__', '__dict__', '__dir__', '__div__', 
+'__doc__', '__eq__', '__float__', '__floordiv__', '__format__', '__ge__', 
+'__getattribute__', '__getitem__', '__gt__', '__hash__', '__iadd__', '__iand__', 
+'__idiv__', '__ifloordiv__', '__ilshift__', '__imul__', '__index__', '__init__', 
+'__init_subclass__', '__int__', '__invert__', '__ior__', '__ipow__', '__irshift__', 
+'__isub__', '__iter__', '__itruediv__', '__ixor__', '__le__', '__len__', '__long__', 
+'__lshift__', '__lt__', '__matmul__', '__mod__', '__module__', '__mul__', '__ne__', 
+'__neg__', '__new__', '__nonzero__', '__or__', '__pow__', '__radd__', '__rdiv__', 
+'__reduce__', '__reduce_ex__', '__repr__', '__reversed__', '__rfloordiv__', '__rmul__', 
+'__rpow__', '__rshift__', '__rsub__', '__rtruediv__', '__setattr__', '__setitem__', 
+'__setstate__', '__sizeof__', '__str__', '__sub__', '__subclasshook__', 
+'__torch_function__', '__truediv__', '__weakref__', '__xor__', 
 
-'_backward_hooks', '_base', '_cdata', '_coalesced_', '_dimI', '_dimV', '_grad', 
-'_grad_fn', '_indices', '_is_view', '_make_subclass', '_nnz', '_update_names', '_values', 
-'_version', 'abs', 'abs_', 'acos', 'acos_', 'add', 'add_', 'addbmm', 'addbmm_', 'addcdiv', 
-'addcdiv_', 'addcmul', 'addcmul_', 'addmm', 'addmm_', 'addmv', 'addmv_', 'addr', 'addr_', 
-'align_as', 'align_to', 'all', 'allclose', 'angle', 'any', 'apply_', 'argmax', 'argmin', 
-'argsort', 'as_strided', 'as_strided_', 'asin', 'asin_', 'atan', 'atan2', 'atan2_', 
-'atan_', 'backward', 'baddbmm', 'baddbmm_', 'bernoulli', 'bernoulli_', 'bfloat16', 
-'bincount', 'bitwise_and', 'bitwise_and_', 'bitwise_not', 'bitwise_not_', 'bitwise_or', 
-'bitwise_or_', 'bitwise_xor', 'bitwise_xor_', 'bmm', 'bool', 'byte', 'cauchy_', 'ceil', 
-'ceil_', 'char', 'cholesky', 'cholesky_inverse', 'cholesky_solve', 'chunk', 'clamp', 
-'clamp_', 'clamp_max', 'clamp_max_', 'clamp_min', 'clamp_min_', 'clone', 'coalesce', 
-'conj', 'contiguous', 'copy_', 'cos', 'cos_', 'cosh', 'cosh_', 'cpu', 'cross', 'cuda', 
-'cummax', 'cummin', 'cumprod', 'cumsum', 'data', 'data_ptr', 'dense_dim', 'dequantize', 
-'det', 'detach', 'detach_', 'device', 'diag', 'diag_embed', 'diagflat', 'diagonal', 
-'digamma', 'digamma_', 'dim', 'dist', 'div', 'div_', 'dot', 'double', 'dtype', 'eig', 
-'element_size', 'eq', 'eq_', 'equal', 'erf', 'erf_', 'erfc', 'erfc_', 'erfinv', 'erfinv_', 
-'exp', 'exp_', 'expand', 'expand_as', 'expm1', 'expm1_', 'exponential_', 'fft', 'fill_', 
-'fill_diagonal_', 'flatten', 'flip', 'float', 'floor', 'floor_', 'floor_divide', 
-'floor_divide_', 'fmod', 'fmod_', 'frac', 'frac_', 'gather', 'ge', 'ge_', 'geometric_', 
-'geqrf', 'ger', 'get_device', 'grad', 'grad_fn', 'gt', 'gt_', 'half', 'hardshrink', 
-'has_names', 'histc', 'ifft', 'index_add', 'index_add_', 'index_copy', 'index_copy_', 
-'index_fill', 'index_fill_', 'index_put', 'index_put_', 'index_select', 'indices', 'int', 
-'int_repr', 'inverse', 'irfft', 'is_coalesced', 'is_complex', 'is_contiguous', 'is_cuda', 
-'is_distributed', 'is_floating_point', 'is_leaf', 'is_mkldnn', 'is_nonzero', 'is_pinned', 
+'_backward_hooks', 
+'_base', '_cdata', '_coalesced_', '_dimI', '_dimV', '_grad', '_grad_fn', '_indices', 
+'_is_view', '_make_subclass', '_nnz', '_update_names', '_values', '_version', 'abs', 
+'abs_', 'absolute', 'absolute_', 'acos', 'acos_', 'acosh', 'acosh_', 'add', 'add_', 
+'addbmm', 'addbmm_', 'addcdiv', 'addcdiv_', 'addcmul', 'addcmul_', 'addmm', 'addmm_', 
+'addmv', 'addmv_', 'addr', 'addr_', 'align_as', 'align_to', 'all', 'allclose', 'amax', 
+'amin', 'angle', 'any', 'apply_', 'arccos', 'arccos_', 'arccosh', 'arccosh_', 'arcsin', 
+'arcsin_', 'arcsinh', 'arcsinh_', 'arctan', 'arctan_', 'arctanh', 'arctanh_', 'argmax', 
+'argmin', 'argsort', 'as_strided', 'as_strided_', 'as_subclass', 'asin', 'asin_', 
+'asinh', 'asinh_', 'atan', 'atan2', 'atan2_', 'atan_', 'atanh', 'atanh_', 'backward', 
+'baddbmm', 'baddbmm_', 'bernoulli', 'bernoulli_', 'bfloat16', 'bincount', 'bitwise_and', 
+'bitwise_and_', 'bitwise_not', 'bitwise_not_', 'bitwise_or', 'bitwise_or_', 
+'bitwise_xor', 'bitwise_xor_', 'bmm', 'bool', 'byte', 'cauchy_', 'ceil', 'ceil_', 
+'char', 'cholesky', 'cholesky_inverse', 'cholesky_solve', 'chunk', 'clamp', 'clamp_', 
+'clamp_max', 'clamp_max_', 'clamp_min', 'clamp_min_', 'clip', 'clip_', 'clone', 
+'coalesce', 'conj', 'contiguous', 'copy_', 'cos', 'cos_', 'cosh', 'cosh_', 
+'count_nonzero', 'cpu', 'cross', 'cuda', 'cummax', 'cummin', 'cumprod', 'cumsum', 
+'data', 'data_ptr', 'deg2rad', 'deg2rad_', 'dense_dim', 'dequantize', 'det', 'detach', 
+'detach_', 'device', 'diag', 'diag_embed', 'diagflat', 'diagonal', 'digamma', 'digamma_', 
+'dim', 'dist', 'div', 'div_', 'divide', 'divide_', 'dot', 'double', 'dtype', 'eig', 
+'element_size', 'eq', 'eq_', 'equal', 'erf', 'erf_', 'erfc', 'erfc_', 'erfinv', 
+'erfinv_', 'exp', 'exp2', 'exp2_', 'exp_', 'expand', 'expand_as', 'expm1', 'expm1_', 
+'exponential_', 'fft', 'fill_', 'fill_diagonal_', 'fix', 'fix_', 'flatten', 'flip', 
+'fliplr', 'flipud', 'float', 'floor', 'floor_', 'floor_divide', 'floor_divide_', 'fmod', 
+'fmod_', 'frac', 'frac_', 'gather', 'gcd', 'gcd_', 'ge', 'ge_', 'geometric_', 'geqrf', 
+'ger', 'get_device', 'grad', 'grad_fn', 'greater', 'greater_', 'greater_equal', 
+'greater_equal_', 'gt', 'gt_', 'half', 'hardshrink', 'has_names', 'heaviside', 
+'heaviside_', 'histc', 'hypot', 'hypot_', 'i0', 'i0_', 'ifft', 'imag', 'index_add', 
+'index_add_', 'index_copy', 'index_copy_', 'index_fill', 'index_fill_', 'index_put', 
+'index_put_', 'index_select', 'indices', 'int', 'int_repr', 'inverse', 'irfft', 
+'is_coalesced', 'is_complex', 'is_contiguous', 'is_cuda', 'is_distributed', 
+'is_floating_point', 'is_leaf', 'is_meta', 'is_mkldnn', 'is_nonzero', 'is_pinned', 
 'is_quantized', 'is_same_size', 'is_set_to', 'is_shared', 'is_signed', 'is_sparse', 
-'isclose', 'item', 'kthvalue', 'layout', 'le', 'le_', 'lerp', 'lerp_', 'lgamma', 
-'lgamma_', 'log', 'log10', 'log10_', 'log1p', 'log1p_', 'log2', 'log2_', 'log_', 
-'log_normal_', 'log_softmax', 'logdet', 'logical_and', 'logical_and_', 'logical_not', 
-'logical_not_', 'logical_or', 'logical_or_', 'logical_xor', 'logical_xor_', 'logsumexp', 
-'long', 'lstsq', 'lt', 'lt_', 'lu', 'lu_solve', 'map2_', 'map_', 'masked_fill', 
-'masked_fill_', 'masked_scatter', 'masked_scatter_', 'masked_select', 'matmul', 
-'matrix_power', 'max', 'mean', 'median', 'min', 'mm', 'mode', 'mul', 'mul_', 
-'multinomial', 'mv', 'mvlgamma', 'mvlgamma_', 'name', 'names', 'narrow', 'narrow_copy', 
-'ndim', 'ndimension', 'ne', 'ne_', 'neg', 'neg_', 'nelement', 'new', 'new_empty', 
-'new_full', 'new_ones', 'new_tensor', 'new_zeros', 'nonzero', 'norm', 'normal_', 'numel', 
-'numpy', 'orgqr', 'ormqr', 'output_nr', 'permute', 'pin_memory', 'pinverse', 'polygamma', 
-'polygamma_', 'pow', 'pow_', 'prelu', 'prod', 'put_', 'q_per_channel_axis', 
-'q_per_channel_scales', 'q_per_channel_zero_points', 'q_scale', 'q_zero_point', 'qr', 
-'qscheme', 'random_', 'reciprocal', 'reciprocal_', 'record_stream', 'refine_names', 
-'register_hook', 'reinforce', 'relu', 'relu_', 'remainder', 'remainder_', 'rename', 
-'rename_', 'renorm', 'renorm_', 'repeat', 'repeat_interleave', 'requires_grad', 
-'requires_grad_', 'reshape', 'reshape_as', 'resize', 'resize_', 'resize_as', 'resize_as_', 
-'retain_grad', 'rfft', 'roll', 'rot90', 'round', 'round_', 'rsqrt', 'rsqrt_', 'scatter', 
-'scatter_', 'scatter_add', 'scatter_add_', 'select', 'set_', 'shape', 'share_memory_', 
-'short', 'sigmoid', 'sigmoid_', 'sign', 'sign_', 'sin', 'sin_', 'sinh', 'sinh_', 'size', 
-'slogdet', 'smm', 'softmax', 'solve', 'sort', 'sparse_dim', 'sparse_mask', 
-'sparse_resize_', 'sparse_resize_and_clear_', 'split', 'split_with_sizes', 'sqrt', 
-'sqrt_', 'square', 'square_', 'squeeze', 'squeeze_', 'sspaddmm', 'std', 'stft', 
-'storage', 'storage_offset', 'storage_type', 'stride', 'sub', 'sub_', 'sum', 
-'sum_to_size', 'svd', 'symeig', 't', 't_', 'take', 'tan', 'tan_', 'tanh', 'tanh_', 'to', 
-'to_dense', 'to_mkldnn', 'to_sparse', 'tolist', 'topk', 'trace', 'transpose', 
-'transpose_', 'triangular_solve', 'tril', 'tril_', 'triu', 'triu_', 'true_divide', 
-'true_divide_', 'trunc', 'trunc_', 'type', 'type_as', 'unbind', 'unflatten', 'unfold', 
-'uniform_', 'unique', 'unique_consecutive', 'unsqueeze', 'unsqueeze_', 'values', 'var', 
-'view', 'view_as', 'where', 'zero_', ]
+'isclose', 'isfinite', 'isinf', 'isnan', 'isneginf', 'isposinf', 'isreal', 'istft', 
+'item', 'kthvalue', 'layout', 'lcm', 'lcm_', 'le', 'le_', 'lerp', 'lerp_', 'less', 
+'less_', 'less_equal', 'less_equal_', 'lgamma', 'lgamma_', 'log', 'log10', 'log10_', 
+'log1p', 'log1p_', 'log2', 'log2_', 'log_', 'log_normal_', 'log_softmax', 'logaddexp', 
+'logaddexp2', 'logcumsumexp', 'logdet', 'logical_and', 'logical_and_', 'logical_not', 
+'logical_not_', 'logical_or', 'logical_or_', 'logical_xor', 'logical_xor_', 'logit', 
+'logit_', 'logsumexp', 'long', 'lstsq', 'lt', 'lt_', 'lu', 'lu_solve', 'map2_', 'map_', 
+'masked_fill', 'masked_fill_', 'masked_scatter', 'masked_scatter_', 'masked_select', 
+'matmul', 'matrix_exp', 'matrix_power', 'max', 'maximum', 'mean', 'median', 'min', 
+'minimum', 'mm', 'mode', 'movedim', 'mul', 'mul_', 'multinomial', 'multiply', 'multiply_', 
+'mv', 'mvlgamma', 'mvlgamma_', 'name', 'names', 'nanquantile', 'nansum', 'narrow', 
+'narrow_copy', 'ndim', 'ndimension', 'ne', 'ne_', 'neg', 'neg_', 'negative', 'negative_', 
+'nelement', 'new', 'new_empty', 'new_full', 'new_ones', 'new_tensor', 'new_zeros', 
+'nextafter', 'nextafter_', 'nonzero', 'norm', 'normal_', 'not_equal', 'not_equal_', 
+'numel', 'numpy', 'orgqr', 'ormqr', 'outer', 'output_nr', 'permute', 'pin_memory', 
+'pinverse', 'polygamma', 'polygamma_', 'pow', 'pow_', 'prelu', 'prod', 'put_', 
+'q_per_channel_axis', 'q_per_channel_scales', 'q_per_channel_zero_points', 'q_scale', 
+'q_zero_point', 'qr', 'qscheme', 'quantile', 'rad2deg', 'rad2deg_', 'random_', 'real', 
+'reciprocal', 'reciprocal_', 'record_stream', 'refine_names', 'register_hook', 'reinforce', 
+'relu', 'relu_', 'remainder', 'remainder_', 'rename', 'rename_', 'renorm', 'renorm_', 
+'repeat', 'repeat_interleave', 'requires_grad', 'requires_grad_', 'reshape', 'reshape_as', 
+'resize', 'resize_', 'resize_as', 'resize_as_', 'retain_grad', 'rfft', 'roll', 'rot90', 
+'round', 'round_', 'rsqrt', 'rsqrt_', 'scatter', 'scatter_', 'scatter_add', 'scatter_add_', 
+'select', 'set_', 'sgn', 'sgn_', 'shape', 'share_memory_', 'short', 'sigmoid', 'sigmoid_', 
+'sign', 'sign_', 'signbit', 'sin', 'sin_', 'sinh', 'sinh_', 'size', 'slogdet', 'smm', 
+'softmax', 'solve', 'sort', 'sparse_dim', 'sparse_mask', 'sparse_resize_', 
+'sparse_resize_and_clear_', 'split', 'split_with_sizes', 'sqrt', 'sqrt_', 'square', 
+'square_', 'squeeze', 'squeeze_', 'sspaddmm', 'std', 'stft', 'storage', 'storage_offset', 
+'storage_type', 'stride', 'sub', 'sub_', 'subtract', 'subtract_', 'sum', 'sum_to_size', 
+'svd', 'symeig', 't', 't_', 'take', 'tan', 'tan_', 'tanh', 'tanh_', 'to', 'to_dense', 
+'to_mkldnn', 'to_sparse', 'tolist', 'topk', 'trace', 'transpose', 'transpose_', 
+'triangular_solve', 'tril', 'tril_', 'triu', 'triu_', 'true_divide', 'true_divide_', 
+'trunc', 'trunc_', 'type', 'type_as', 'unbind', 'unflatten', 'unfold', 'uniform_', 
+'unique', 'unique_consecutive', 'unsafe_chunk', 'unsafe_split', 
+'unsafe_split_with_sizes', 'unsqueeze', 'unsqueeze_', 'values', 'var', 'vdot', 
+'view', 'view_as', 'where', 'zero_']
 
 
 ### TODOS ###
 """
+0)  Implement logarithm functions
+0b) Implement sum, mean, var functions
+2)  Finish getting and setting methods for indexing
+
 1)  Enforce type constraint that data is always some type of float, 
     scale is always some type of int
-
-2)  Finish getting and setting methods for indexing
 
 3)  Find elegant way of resolving issue with zero slices. These currently
     have an arbitrary scale tensor, which could lead to some issue later.
     Find a way of setting the scale values *really* small, something like
     the minimum value of the integer datatype
+
+4)  Implement view and reshaping operations
 
 """
 
@@ -870,10 +942,16 @@ GENERIC_ERROR = NotImplementedError("Something went wrong, please let me "
                                     "know and I will try to fix it")
 
 if __name__ == '__main__':
-    mat = stensor(torch.randn(5, 5), (0,))
-    dub1, dub2 = 2 * mat, torch.add(mat, mat)
-    print(bool(mat))
-    breakpoint()
+    matrix = torch.randn(10, 10)
+    vector = torch.randn(10)
+    vector = stensor(vector)
+
+    for i in range(10):
+        vector = torch.mv(matrix, vector)
+
+    # sum_vec = torch.sum(vector)
+    output = torch.log(vector.abs())
+    print(torch.log(vector.abs()) / torch.log2(vector.abs()))
 
 
     # # Get the nontrivial attributes of a Pytorch tensor
