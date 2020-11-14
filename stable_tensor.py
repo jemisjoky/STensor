@@ -4,7 +4,7 @@ import functools
 
 import torch
 
-from utils import bad_conversion, tupleize, squeeze_dims
+from utils import bad_conversion, tupleize, squeeze_dims, flatten_index
 
 """
 NOTE: Requires torch version >= 1.7.0
@@ -273,15 +273,15 @@ class STensor:
         return self.data.__bool__()
 
     def __getitem__(self, idx):
-        # Cases to consider are
-        #   * Pytorch tensors (advanced indexing, not handled)
-        #   * Tuples of primitive indices (pinds) or bare pinds, 
-        #     where pinds include the following cases
-        #       * integers
-        #       * slices
-        #       * None
-        #       * Ellipsis
-        raise NotImplementedError
+        if isinstance(idx, (torch.Tensor, STensor)):
+            raise NotImplementedError("STensors don't support advanced indexing yet")
+
+        # Produce "flat" index to use for indexing scale tensor
+        flat_idx = flatten_index(idx, self.scale)
+        stens_out = STensor(self.data[idx], self.scale[flat_idx])
+        stens_out.rescale_()
+
+        return stens_out
 
 
 
@@ -588,10 +588,6 @@ def sumlike_wrap(fun_name):
 
     # Register the new sum-like function
     STABLE_FUNCTIONS[torch_fun] = sumlike_fun
-
-# def median_like(fun_name):
-#     """Handle torch.median and torch.mode"""
-
 
 def existing_method_from_name(fun_name):
     """Add method to STensor for existing stable function"""
@@ -962,9 +958,9 @@ ATTRIBUTES = ['T', '__abs__', '__add__', '__and__', '__array__', '__array_priori
 
 ### TODOS ###
 """
-0b) Implement sum, mean, var functions
+0b) Implement std and var functions
 0c) Fix issue with mv and shapes not matching up
-2)  Finish getting and setting methods for indexing
+2)  Finish setting method for indexing
 
 1)  Enforce type constraint that data is always some type of float, 
     scale is always some type of int
@@ -975,8 +971,7 @@ ATTRIBUTES = ['T', '__abs__', '__add__', '__and__', '__array__', '__array_priori
     the minimum value of the integer datatype
 
 4)  Implement view and reshaping operations
-
-5)  Implement device changing operations (just `to`?)
+5)  Implement device changing operations (to, cuda, cpu)
 
 """
 
@@ -985,21 +980,8 @@ GENERIC_ERROR = NotImplementedError("Something went wrong, please let me "
                                     "know and I will try to fix it")
 
 if __name__ == '__main__':
-    matrix = torch.randn(10, 10)
-    vector = torch.randn(1000)
-    matrix = stensor(matrix, (0,))
-
-    fun = functools.partial(torch.mean, dim=(0,1))
-    output = fun(matrix) - fun(matrix.to_tensor())
-    print(repr(output))
-    quit()
-
-    # for i in range(10):
-    #     vector = torch.mv(matrix, vector)
-
-    # sum_vec = torch.sum(vector)
-    output = torch.log(vector.abs())
-    print(torch.log(vector.abs()) / torch.log2(vector.abs()))
+    tensor = torch.randn(2, 3, 4, 5)
+    tensor = stensor(tensor, (1,3))
 
 
     # # Get the nontrivial attributes of a Pytorch tensor
