@@ -4,6 +4,8 @@ import functools
 
 import torch
 
+from utils import bad_conversion, tupleize, squeeze_dims
+
 """
 NOTE: Requires torch version >= 1.7.0
 """
@@ -14,8 +16,6 @@ NOTE: Requires torch version >= 1.7.0
 @functools.lru_cache()
 def TARGET_SCALE(shape, data_dims):
     assert all(d >= 0 for d in data_dims)
-    if isinstance(shape, torch.Tensor):
-        shape = shape.shape
     shape = tuple(shape[i] for i in data_dims)
 
     # We want to have one_norm(tensor) ~= num_el
@@ -120,7 +120,10 @@ class STensor:
         """In-place rescaling method"""
         # Get the L1 norm of data and scale correction for each fiber
         data_dims = self.data_dims
-        tens_scale = torch.sum(self.data.abs(), dim=data_dims, keepdim=True)
+        if data_dims == ():
+            tens_scale = self.data.abs()
+        else:
+            tens_scale = torch.sum(self.data.abs(), dim=data_dims, keepdim=True)
         log_shift = torch.floor(TARGET_SCALE(self.shape, data_dims) - 
                                 torch.log2(tens_scale))
 
@@ -136,7 +139,10 @@ class STensor:
         """Return STensor with rescaled data"""
         # Get the L1 norm of data and scale correction for each fiber
         data_dims = self.data_dims
-        tens_scale = torch.sum(self.data.abs(), dim=data_dims, keepdim=True)
+        if data_dims is ():
+            tens_scale = self.data.abs()
+        else:
+            tens_scale = torch.sum(self.data.abs(), dim=data_dims, keepdim=True)
         log_shift = torch.floor(TARGET_SCALE(self.shape, data_dims) - 
                                 torch.log2(tens_scale))
 
@@ -266,9 +272,6 @@ class STensor:
     def __bool__(self):
         return self.data.__bool__()
 
-
-    
-
     def __getitem__(self, idx):
         # Cases to consider are
         #   * Pytorch tensors (advanced indexing, not handled)
@@ -356,13 +359,6 @@ def same_scale(*tensors):
 
     return tuple(data_list), out_scale
 
-def bad_conversion(stens, tensor):
-    """Check if conversion to tensor led to underflow/overflow problems"""
-    underflow = torch.any(torch.logical_and(tensor==0, stens.data!=0))
-    overflow = torch.any(torch.logical_and(torch.isinf(tensor), 
-                                           torch.isfinite(stens.data)))
-    return underflow or overflow
-
 ### Tools to convert/register Pytorch functions as ones on STensors ###
 
 # Dictionary to store reimplemented Pytorch functions for use on stensors
@@ -390,9 +386,6 @@ def hom_wrap(fun_name, hom_degs, data_lens, in_place=False):
 
     @functools.wraps(torch_fun)
     def stable_fun(*args, **kwargs):
-        # TODO: Do shape inference to be able to handle non-stensor inputs
-        # for homogeneous args, warn when there's ambiguity
-
         # Separate out homogeneous args and put everything in all_args
         all_args, in_scales = [], []
         for i, t in enumerate(args):
@@ -406,9 +399,9 @@ def hom_wrap(fun_name, hom_degs, data_lens, in_place=False):
                     # not on stable dims
                     nd, dd = t.ndim, t.data_dims
                     if not all(j in dd for j in range(nd-data_lens[i], nd)):
-                        raise ValueError(f"STensor input {i} to {fun_name} must have "
-                                         f"at least {data_lens[i]} data dims, "
-                                         f"current data dims are {t.data_dims}")
+                        raise ValueError(f"STensor input {i} to {fun_name} "
+                                f"must have at least {data_lens[i]} data "
+                                f"dims, current data dims are {t.data_dims}")
                 else:
                     # Nonhomogeneous input args
                     all_args.append(t)
@@ -455,7 +448,7 @@ def torch_wrap(fun_name, in_place=False, data_only=False, rescale=False):
                     have the same scale tensor, which is then used as
                     a scale tensor for the output when data_only is True
     """
-    # TODO: Refactor this to minimize all the opaque overlapping conditions
+    # TODO: Refactor this to minimize all the spaghetti code
     assert not (in_place and data_only)
     if in_place:
         torch_fun = getattr(torch.Tensor, fun_name)
@@ -555,13 +548,50 @@ def log_wrap(fun_name):
 
     # The new logarithm function
     @functools.wraps(torch_fun)
-    def log_fun(input, *, out=None):
+    def log_fun(input):
         assert isinstance(input, STensor)
         output = torch_fun(input.data) + input.scale/base_coeff
         return stensor(output)
 
     # Register the new logarithm function
     STABLE_FUNCTIONS[torch_fun] = log_fun
+
+def sumlike_wrap(fun_name):
+    """Handle torch.sum and torch.mean"""
+    # Define appropriate torch function, the rest of the logic is the same
+    assert fun_name in ['sum', 'mean']
+    torch_fun = getattr(torch, fun_name)
+
+    @functools.wraps(torch_fun)
+    def sumlike_fun(input, dim=None, keepdim=False):
+        nodim = dim is None
+        if nodim:
+            # Remove stable dims, then sum over data
+            input = move_sdims(input, ())
+            data_sum = torch_fun(input.data)
+            scale = input.scale.view(())
+            output = STensor(data_sum, scale)
+        else:
+            # Convert dim to list of non-negative indices to sum over
+            dim_list = tupleize(dim, input.ndim)
+            # Make summed indices data dims, then sum over data tensor
+            new_sdims = tuple(i for i in input.stable_dims 
+                                        if i not in dim_list)
+            input = move_sdims(input, new_sdims)
+            data_sum = torch_fun(input.data, dim, keepdim=keepdim)
+            scale = input.scale
+            if not keepdim:
+                scale = squeeze_dims(scale, dim_list)
+            output = STensor(data_sum, scale)
+        output.rescale_()
+        return output
+
+    # Register the new sum-like function
+    STABLE_FUNCTIONS[torch_fun] = sumlike_fun
+
+# def median_like(fun_name):
+#     """Handle torch.median and torch.mode"""
+
 
 def existing_method_from_name(fun_name):
     """Add method to STensor for existing stable function"""
@@ -599,8 +629,11 @@ def inplace_torch_method_from_name(fun_name):
 def transpose(input, dim0, dim1):
     return STensor(torch.transpose(input.data, dim0, dim1), 
                    torch.transpose(input.scale, dim0, dim1))
-
-
+def transpose_(self, dim0, dim1):
+    self.data.transpose_(dim0, dim1)
+    self.scale.transpose_(dim0, dim1)
+STensor.transpose_ = transpose_
+STensor.transpose_.__doc__ = torch.Tensor.transpose_.__doc__
 
 ### Re-registration of the Pytorch library as stable functions ###
 
@@ -708,6 +741,9 @@ SCALE_TORCH = {'add': False,
                }
 
 LOG_FUNS = ['log', 'log10', 'log2']
+SUMLIKE_FUNS = ['sum', 'mean']
+MODELIKE_FUNS = ['mode', 'median']
+VARLIKE_FUNS = ['var', 'std']
 
 # Register all homogeneous functions as functions on stensors
 for fun_name, hom_data in HOMOG.items():
@@ -736,6 +772,10 @@ for fun_name, data_only in SCALE_TORCH.items():
 # Register logarithm functions as functions on stensors
 for fun_name in LOG_FUNS:
     log_wrap(fun_name)
+
+# Register sum and mean
+for fun_name in SUMLIKE_FUNS:
+    sumlike_wrap(fun_name)
 
 # Doesn't make sense with stensors, and/or method doesn't have PyTorch
 # documentation. Not implementing
@@ -775,7 +815,8 @@ DOUBTFUL = ['affine_grid_generator', 'alpha_dropout', 'adaptive_avg_pool1d',
 'topk', 'tril_indices', 'triu_indices', 'triplet_margin_loss', 'unbind', 'zeros_like', ]
 
 # Important and/or easy functions
-DO_NOW = ['einsum', 'log', 'log10', 'log2', 'max', 'min', 'sqrt', 'rsqrt', ]
+DO_NOW = ['einsum', 'max', 'min', 'sqrt', 'rsqrt', 'median', 'mode', 
+'var', 'std']
 
 # Somewhat important and/or trickier functions
 DO_SOON = ['allclose', 'argsort', 'broadcast_tensors', 'cat', 'stack', 'chain_matmul', 
@@ -787,8 +828,7 @@ DO_SOON = ['allclose', 'argsort', 'broadcast_tensors', 'cat', 'stack', 'chain_ma
 # Homogeneous functions whose hom degree is based on other info
 'det', 'prod', 'matrix_power', 
 # Almost a standard homogeneous function, but contains additional dim information
-'transpose', 'tensordot', 'mean', 'median', 'mode', 'var', 'std', 'sum', 'cross', 
-'cumsum', 
+'tensordot', 'cross', 'cumsum', 
 # Matrix decompositions whose return types must be respected
 'qr', 'eig', 'lstsq', 'svd', 'symeig', 'triangular_solve', 'solve']
 
@@ -805,13 +845,14 @@ ALL_FUN = list(HOMOG.keys()) + DOUBTFUL + list(TORCH) + DO_NOW + DO_SOON + LATER
 EXISTING_METHOD = ['abs', 'bmm', 'conj', 'cross', 'div', 'dot', 'ger', 'inverse', 
 'matmul', 'mm', 'mode', 'mul', 'mv', 'pinverse', 'reciprocal', 'relu', 'square', 
 'std', 'sum', 't', 'trace', 'transpose', 'tril', 'triu', 'true_divide', 'var',
-'acos', 'angle', 'asin', 'atan', 'atan2', 'ceil', 'clamp', 
-'clamp_max', 'clamp_min', 'cos', 'cosh', 'digamma', 'erf', 'erfc', 'erfinv', 
-'exp', 'expm1', 'fft', 'floor', 'fmod', 'frac', 'ifft', 'irfft', 'is_complex', 
+'acos', 'angle', 'asin', 'atan', 'atan2', 'ceil', 'clamp', 'clamp_max', 
+'clamp_min', 'cos', 'cosh', 'digamma', 'erf', 'erfc', 'erfinv', 'exp', 'expm1', 
+'fft', 'floor', 'fmod', 'frac', 'ifft', 'irfft', 'is_complex', 
 'is_floating_point', 'is_nonzero', 'is_same_size', 'kthvalue', 'lerp', 'lgamma', 
 'logdet', 'logical_and', 'logical_not', 'logical_or', 'logical_xor', 'numel', 
 'rfft', 'round', 'sigmoid', 'sin', 'sinh', 'stft', 'tan', 'tanh', 'trunc',
-'add', 'sub', 'eq', 'ne', 'equal', 'ge', 'gt', 'le', 'lt', ]
+'add', 'sub', 'eq', 'ne', 'equal', 'ge', 'gt', 'le', 'lt', 'log', 'log10', 
+'log2', 'transpose', 'mean', 'sum']
 
 HOM_INPLACE = ['abs_', 'div_', 'mul_', 'reciprocal_', 'relu_', 'square_', 
                't_', 'true_divide_', ]
@@ -921,8 +962,8 @@ ATTRIBUTES = ['T', '__abs__', '__add__', '__and__', '__array__', '__array_priori
 
 ### TODOS ###
 """
-0)  Implement logarithm functions
 0b) Implement sum, mean, var functions
+0c) Fix issue with mv and shapes not matching up
 2)  Finish getting and setting methods for indexing
 
 1)  Enforce type constraint that data is always some type of float, 
@@ -935,6 +976,8 @@ ATTRIBUTES = ['T', '__abs__', '__add__', '__and__', '__array__', '__array_priori
 
 4)  Implement view and reshaping operations
 
+5)  Implement device changing operations (just `to`?)
+
 """
 
 
@@ -943,11 +986,16 @@ GENERIC_ERROR = NotImplementedError("Something went wrong, please let me "
 
 if __name__ == '__main__':
     matrix = torch.randn(10, 10)
-    vector = torch.randn(10)
-    vector = stensor(vector)
+    vector = torch.randn(1000)
+    matrix = stensor(matrix, (0,))
 
-    for i in range(10):
-        vector = torch.mv(matrix, vector)
+    fun = functools.partial(torch.mean, dim=(0,1))
+    output = fun(matrix) - fun(matrix.to_tensor())
+    print(repr(output))
+    quit()
+
+    # for i in range(10):
+    #     vector = torch.mv(matrix, vector)
 
     # sum_vec = torch.sum(vector)
     output = torch.log(vector.abs())
