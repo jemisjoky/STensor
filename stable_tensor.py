@@ -1,10 +1,11 @@
 import warnings
 import itertools
-import functools
+from functools import wraps, lru_cache, reduce
 
 import torch
 
-from utils import bad_conversion, tupleize, squeeze_dims, flatten_index
+from utils import (bad_conversion, tupleize, squeeze_dims, flatten_index, 
+                   scalar_scale)
 
 """
 NOTE: Requires torch version >= 1.7.0
@@ -13,7 +14,7 @@ NOTE: Requires torch version >= 1.7.0
 # Function giving the target one-norm of a STensor based on its shape.
 # TARGET_SCALE is a sort of module-wise hyperparameter whose choice
 # influences the stability of operations on STensor instances
-@functools.lru_cache()
+@lru_cache()
 def TARGET_SCALE(shape, data_dims):
     assert all(d >= 0 for d in data_dims)
     shape = tuple(shape[i] for i in data_dims)
@@ -88,7 +89,7 @@ class STensor:
         # Check for warning during conversion, remove disclaimer if not needed
         with warnings.catch_warnings(record=True) as wrec:
             warnings.simplefilter("always")
-            t = self.to_tensor()
+            t = self.torch()
             if len(wrec) == 0:
                 disclaimer = ""
         return f"stable\n{t}{disclaimer}"
@@ -154,14 +155,14 @@ class STensor:
         return STensor(self.data*(2**log_shift), 
                        self.scale-log_shift)
 
-    def to_tensor(self):
-        """Return destabilized Tensor version of STensor"""
+    def torch(self):
+        """Return vanilla Pytorch Tensor reduction of STensor"""
         tensor = self.data * 2**self.scale
         
         # Check for and warn about errors in conversion
         if bad_conversion(self, tensor):
             warnings.warn("Underflow and/or overflow detected "
-                          "during to_tensor() call", RuntimeWarning)
+                          "during torch() call", RuntimeWarning)
 
         return tensor
 
@@ -264,7 +265,7 @@ class STensor:
         return len(self.data)
 
     def __contains__(self, other):
-        return self.to_tensor().__contains__(other)
+        return self.torch().__contains__(other)
 
     def __reversed__(self):
         return STensor(self.data.flip(0), self.scale.flip(0))
@@ -283,7 +284,28 @@ class STensor:
 
         return stens_out
 
+    def __setitem__(self, idx, value):
+        # TODO: Fix this limitation to scalar scale tensors
+        if not scalar_scale(self) or (isinstance(value, STensor) and 
+                                        not scalar_scale(value)):
+            raise NotImplementedError("Assignment currently only implemented "
+                            "for stensors with single-element scale tensors")
 
+        # Ensure value is stensor or tensor
+        if not isinstance(value, (torch.Tensor, STensor)):
+            value = torch.tensor(value)
+
+        # Adapt value to have same scale tensor as self
+        if isinstance(value, STensor):
+            shift = value.scale.view(()) - self.scale.view(())
+            value = value.data
+        else:
+            shift = -self.scale.view(())
+        value = value * 2**shift
+
+        # Set data tensor
+        self.data[idx] = value
+        self.rescale_()
 
 def move_sdims(stens, stable_dims):
     """Return copy of input STensor with new stable dims"""
@@ -351,18 +373,67 @@ def same_scale(*tensors):
     if len(tensors) == 2:
         out_scale = torch.maximum(*scale_list)
     else:
-        out_scale = functools.reduce(torch.maximum, 
-                                     scale_list[1:], scale_list[0])
+        out_scale = reduce(torch.maximum, scale_list[1:], scale_list[0])
 
     # Rescale all data tensors to correspond to out_scale
     data_list = [t * 2**(s-out_scale) for t, s in zip(data_list, scale_list)]
 
     return tuple(data_list), out_scale
 
-### Tools to convert/register Pytorch functions as ones on STensors ###
+### Re-implementations of individual Pytorch functions ###
 
 # Dictionary to store reimplemented Pytorch functions for use on stensors
 STABLE_FUNCTIONS = {}
+
+def minimal_wrap(new_fun):
+    """Take a single function and set it as the Torch override for STensors"""
+    fun_name = new_fun.__name__
+    assert fun_name in dir(torch)
+    torch_fun = getattr(torch, fun_name)
+    new_fun.__doc__ = torch_fun.__doc__
+    STABLE_FUNCTIONS[torch_fun] = new_fun
+    return new_fun
+
+@minimal_wrap
+def transpose(input, dim0, dim1):
+    return STensor(torch.transpose(input.data, dim0, dim1), 
+                   torch.transpose(input.scale, dim0, dim1))
+@wraps(torch.Tensor.transpose_)
+def transpose_(self, dim0, dim1):
+    self.data.transpose_(dim0, dim1)
+    self.scale.transpose_(dim0, dim1)
+STensor.transpose_ = transpose_
+
+@wraps(torch.Tensor.view)
+def view(self, *shape):
+    # TODO: Handle case where self has nontrivial stable dims
+    if not scalar_scale(self):
+        raise NotImplementedError("STensor.view currently only implemented "
+                        "for stensors with single-element scale tensors")
+    if len(shape) == 1 and isinstance(shape[0], tuple):
+        shape = shape[0]
+    return STensor(self.data.view(*shape), 
+                   self.scale.view((-1,)*len(shape)))
+STensor.view = view
+
+@wraps(torch.Tensor.view_as)
+def view_as(self, other):
+    # TODO: When other is an STensor, shift stable dims to match other
+    return self.view(other.shape)
+STensor.view_as = view_as
+
+@minimal_wrap
+def reshape(input, *shape):
+    # TODO: Handle case where input has nontrivial stable dims
+    if not scalar_scale(input):
+        raise NotImplementedError("reshape currently only implemented "
+                        "for stensors with single-element scale tensors")
+    if len(shape) == 1 and isinstance(shape[0], tuple):
+        shape = shape[0]
+    return STensor(input.data.reshape(*shape), 
+                   input.scale.view((-1,)*len(shape)))
+
+### Tools to convert families of Pytorch functions to ones on STensors ###
 
 def hom_wrap(fun_name, hom_degs, data_lens, in_place=False):
     """
@@ -384,7 +455,7 @@ def hom_wrap(fun_name, hom_degs, data_lens, in_place=False):
     else:
         torch_fun = getattr(torch, fun_name)
 
-    @functools.wraps(torch_fun)
+    @wraps(torch_fun)
     def stable_fun(*args, **kwargs):
         # Separate out homogeneous args and put everything in all_args
         all_args, in_scales = [], []
@@ -455,7 +526,7 @@ def torch_wrap(fun_name, in_place=False, data_only=False, rescale=False):
     else:
         torch_fun = getattr(torch, fun_name)
 
-    @functools.wraps(torch_fun)
+    @wraps(torch_fun)
     def wrapped_fun(*args, **kwargs):
         # For in-place evaluation, pull out first input
         if in_place:
@@ -475,7 +546,7 @@ def torch_wrap(fun_name, in_place=False, data_only=False, rescale=False):
         for i, t in enumerate(args):
             if isinstance(t, STensor):
                 data_list.append(t.data if (data_only or (rescale and i<2)) 
-                                 else t.to_tensor())
+                                 else t.torch())
                 scale_list.append(t.scale)
             else:
                 data_list.append(t)
@@ -528,15 +599,6 @@ def torch_wrap(fun_name, in_place=False, data_only=False, rescale=False):
 
     return wrapped_fun
 
-def minimal_wrap(new_fun):
-    """Take a single function and set it as the Torch override for STensors"""
-    fun_name = new_fun.__name__
-    assert fun_name in dir(torch)
-    torch_fun = getattr(torch, fun_name)
-    new_fun.__doc__ = torch_fun.__doc__
-    STABLE_FUNCTIONS[torch_fun] = new_fun
-    return new_fun
-
 def log_wrap(fun_name):
     """Simple wrapper to reimplement and register logarithm functions"""
     assert fun_name in ['log', 'log10', 'log2']
@@ -547,7 +609,7 @@ def log_wrap(fun_name):
     base_coeff = base_lookup[fun_name]
 
     # The new logarithm function
-    @functools.wraps(torch_fun)
+    @wraps(torch_fun)
     def log_fun(input):
         assert isinstance(input, STensor)
         output = torch_fun(input.data) + input.scale/base_coeff
@@ -562,7 +624,7 @@ def sumlike_wrap(fun_name):
     assert fun_name in ['sum', 'mean']
     torch_fun = getattr(torch, fun_name)
 
-    @functools.wraps(torch_fun)
+    @wraps(torch_fun)
     def sumlike_fun(input, dim=None, keepdim=False):
         nodim = dim is None
         if nodim:
@@ -618,18 +680,6 @@ def inplace_torch_method_from_name(fun_name):
         data_only = SCALE_TORCH[fun_name[:-1]]
     wrapped_method = torch_wrap(fun_name, in_place=True, data_only=data_only)
     setattr(STensor, fun_name, wrapped_method)
-
-### Re-implementations of individual Pytorch functions ###
-
-@minimal_wrap
-def transpose(input, dim0, dim1):
-    return STensor(torch.transpose(input.data, dim0, dim1), 
-                   torch.transpose(input.scale, dim0, dim1))
-def transpose_(self, dim0, dim1):
-    self.data.transpose_(dim0, dim1)
-    self.scale.transpose_(dim0, dim1)
-STensor.transpose_ = transpose_
-STensor.transpose_.__doc__ = torch.Tensor.transpose_.__doc__
 
 ### Re-registration of the Pytorch library as stable functions ###
 
@@ -817,7 +867,7 @@ DO_NOW = ['einsum', 'max', 'min', 'sqrt', 'rsqrt', 'median', 'mode',
 # Somewhat important and/or trickier functions
 DO_SOON = ['allclose', 'argsort', 'broadcast_tensors', 'cat', 'stack', 'chain_matmul', 
 'cumprod', 'detach', 'diag', 'diagonal', 'flatten', 'flip', 'floor_divide', 'gather', 
-'pow', 'reshape', 'squeeze', 'unsqueeze', 'sort', 'split', 'dist',
+'pow', 'squeeze', 'unsqueeze', 'sort', 'split', 'dist',
 # Homogeneous functions that for one reason or another can't be handled by hom_wrap
 'pdist', 'trapz', 'take', 'unique_consecutive', 'var_mean', 'lu_solve', 'std_mean', 
 'tril', 'triu', 'argmax', 'argmin', 
@@ -838,17 +888,17 @@ ALL_FUN = list(HOMOG.keys()) + DOUBTFUL + list(TORCH) + DO_NOW + DO_SOON + LATER
 
 ### Register stabilized Pytorch functions as methods for stensors ###
 
-EXISTING_METHOD = ['abs', 'bmm', 'conj', 'cross', 'div', 'dot', 'ger', 'inverse', 
-'matmul', 'mm', 'mode', 'mul', 'mv', 'pinverse', 'reciprocal', 'relu', 'square', 
-'std', 'sum', 't', 'trace', 'transpose', 'tril', 'triu', 'true_divide', 'var',
-'acos', 'angle', 'asin', 'atan', 'atan2', 'ceil', 'clamp', 'clamp_max', 
-'clamp_min', 'cos', 'cosh', 'digamma', 'erf', 'erfc', 'erfinv', 'exp', 'expm1', 
-'fft', 'floor', 'fmod', 'frac', 'ifft', 'irfft', 'is_complex', 
-'is_floating_point', 'is_nonzero', 'is_same_size', 'kthvalue', 'lerp', 'lgamma', 
-'logdet', 'logical_and', 'logical_not', 'logical_or', 'logical_xor', 'numel', 
-'rfft', 'round', 'sigmoid', 'sin', 'sinh', 'stft', 'tan', 'tanh', 'trunc',
-'add', 'sub', 'eq', 'ne', 'equal', 'ge', 'gt', 'le', 'lt', 'log', 'log10', 
-'log2', 'transpose', 'mean', 'sum']
+EXISTING_METHOD = ['abs', 'bmm', 'conj', 'div', 'dot', 'ger', 'inverse', 
+'matmul', 'mm', 'mul', 'mv', 'pinverse', 'reciprocal', 'relu', 'square', 
+'sum', 't', 'trace', 'transpose', 'true_divide', 'acos', 'angle', 'asin', 
+'atan', 'atan2', 'ceil', 'clamp', 'clamp_max', 'clamp_min', 'cos', 'cosh', 
+'digamma', 'erf', 'erfc', 'erfinv', 'exp', 'expm1', 'fft', 'floor', 'fmod', 
+'frac', 'ifft', 'irfft', 'is_complex', 'is_floating_point', 'is_nonzero', 
+'is_same_size', 'kthvalue', 'lerp', 'lgamma', 'logdet', 'logical_and', 
+'logical_not', 'logical_or', 'logical_xor', 'numel', 'rfft', 'round', 
+'sigmoid', 'sin', 'sinh', 'stft', 'tan', 'tanh', 'trunc', 'add', 'sub', 
+'eq', 'ne', 'equal', 'ge', 'gt', 'le', 'lt', 'log', 'log10', 'log2', 
+'transpose', 'mean', 'sum', 'reshape', ]
 
 HOM_INPLACE = ['abs_', 'div_', 'mul_', 'reciprocal_', 'relu_', 'square_', 
                't_', 'true_divide_', ]
@@ -970,18 +1020,18 @@ ATTRIBUTES = ['T', '__abs__', '__add__', '__and__', '__array__', '__array_priori
     Find a way of setting the scale values *really* small, something like
     the minimum value of the integer datatype
 
-4)  Implement view and reshaping operations
+4)  Implement view, reshaping, and element setting operations on stensors
+    with non-scalar scale tensors
 5)  Implement device changing operations (to, cuda, cpu)
 
 """
 
-
 GENERIC_ERROR = NotImplementedError("Something went wrong, please let me "
-                                    "know and I will try to fix it")
+                                    "know at https://github.com/jemisjoky/STensor/issues")
 
 if __name__ == '__main__':
     tensor = torch.randn(2, 3, 4, 5)
-    tensor = stensor(tensor, (1,3))
+    tensor = stensor(tensor)
 
 
     # # Get the nontrivial attributes of a Pytorch tensor

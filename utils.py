@@ -54,3 +54,6 @@ def flatten_index(idx, scale):
     else:
         # Singleton indexing object
         return flatmap(idx, 0) if real_idx(idx) else idx
+
+def scalar_scale(stens):
+    return stens.scale.numel() == 1
