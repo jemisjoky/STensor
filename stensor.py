@@ -56,9 +56,10 @@ def stensor(data, stable_dims=(), dtype=None, device=None,
         else:
             return move_sdims(data, stable_dims)
 
-    # Convert data to Pytorch tensor if it's not already
+    # Convert data to Pytorch float tensor if it's not already
     if not isinstance(data, torch.Tensor):
         data = torch.tensor(data)
+    data = data.float()
     num_dims = len(data.shape)
     assert all(0 <= d < num_dims for d in stable_dims)
 
@@ -85,14 +86,14 @@ class STensor:
     def __str__(self):
         # Disclaimer for any questionable printed values
         disclaimer = ("\ninf and/or zero entries may be artifact of conversion"
-                      "\nto non-stable tensor, use repr to view underlying data")
+                      "\nto Tensor, use repr to view underlying data")
         # Check for warning during conversion, remove disclaimer if not needed
         with warnings.catch_warnings(record=True) as wrec:
             warnings.simplefilter("always")
             t = self.torch()
             if len(wrec) == 0:
                 disclaimer = ""
-        return f"stable\n{t}{disclaimer}"
+        return f"s{t}{disclaimer}"
 
     def __repr__(self):
         return f"STensor(data=\n{self.data}, scale=\n{self.scale})"
@@ -433,6 +434,23 @@ def reshape(input, *shape):
     return STensor(input.data.reshape(*shape), 
                    input.scale.view((-1,)*len(shape)))
 
+@minimal_wrap
+def mv(input, vec):
+    # Ensure inputs are stensors with correct data_dims
+    if not isinstance(input, STensor):
+        input = stensor(input)
+    if not isinstance(vec, STensor):
+        vec = stensor(vec)
+    if input.stable_dims != () or vec.stable_dims != ():
+        raise ValueError(f"Both inputs to mv must have trivial stable dims")
+    
+    # Apply mv on underlying data, sum scale values
+    output = STensor(torch.mv(input.data, vec.data), 
+                     input.scale[0] + vec.scale)
+    output.rescale_()
+
+    return output
+
 ### Tools to convert families of Pytorch functions to ones on STensors ###
 
 def hom_wrap(fun_name, hom_degs, data_lens, in_place=False):
@@ -443,10 +461,12 @@ def hom_wrap(fun_name, hom_degs, data_lens, in_place=False):
         fun_name:  Name of homogeneous Pytorch function to be wrapped
         hom_degs:  List of integers, each giving the degree of homoegeneity 
                    of a homogeneous input argument to fun_name
-        data_lens: List of non-negative integers, each 
+        data_lens: List of non-negative integers, each giving the minimum 
+                   number of data dims at the end of homog input argument
         in_place:  Boolean specifying if we should implement the operation 
                    as an in-place method
     """
+    # TODO: Simplify code to reflect data_lens being uniform for all args
     # Preprocess homogeneous info to get flags to be called by stable_fun
     assert all(d >= 0 for d in data_lens)
     num_homs = len(hom_degs)
@@ -471,7 +491,7 @@ def hom_wrap(fun_name, hom_degs, data_lens, in_place=False):
                     nd, dd = t.ndim, t.data_dims
                     if not all(j in dd for j in range(nd-data_lens[i], nd)):
                         raise ValueError(f"STensor input {i} to {fun_name} "
-                                f"must have at least {data_lens[i]} data "
+                                f"must have last {data_lens[i]} dims as data "
                                 f"dims, current data dims are {t.data_dims}")
                 else:
                     # Nonhomogeneous input args
@@ -652,11 +672,12 @@ def sumlike_wrap(fun_name):
     STABLE_FUNCTIONS[torch_fun] = sumlike_fun
 
 def existing_method_from_name(fun_name):
-    """Add method to STensor for existing stable function"""
+    """Add method to STensor and torch.Tensor for existing stable function"""
     global STensor
     assert hasattr(torch.Tensor, fun_name)
     if getattr(torch, fun_name) in STABLE_FUNCTIONS:
         stable_fun = STABLE_FUNCTIONS[getattr(torch, fun_name)]
+        STABLE_FUNCTIONS[getattr(torch.Tensor, fun_name)] = stable_fun
         setattr(STensor, fun_name, stable_fun)
     else:
         print(f"STILL NEED TO IMPLEMENT {fun_name}")
@@ -696,11 +717,9 @@ HOMOG = {'abs':               ((1, 0),),
          'imag':              ((1, 0),),
          'real':              ((1, 0),),
          'inverse':           ((-1, 2),),
-         'matmul':            ((1, 2), (1, 2)),
+         'matmul':            ((1, 1), (1, 1)),
          'mm':                ((1, 2), (1, 2)),
          'mul':               ((1, 0), (1, 0)),
-         # Change hom wrapper if I add another hom fun with mixed data_lens
-         'mv':                ((1, 2), (1, 1)),
          'pinverse':          ((-1, 2),),
          'reciprocal':        ((-1, 0),),
          'relu':              ((1, 0),),
@@ -1008,21 +1027,19 @@ ATTRIBUTES = ['T', '__abs__', '__add__', '__and__', '__array__', '__array_priori
 
 ### TODOS ###
 """
-0b) Implement std and var functions
-0c) Fix issue with mv and shapes not matching up
+1)  Implement std and var functions
 2)  Finish setting method for indexing
-
-1)  Enforce type constraint that data is always some type of float, 
+3)  Enforce type constraint that data is always some type of float, 
     scale is always some type of int
-
-3)  Find elegant way of resolving issue with zero slices. These currently
+4)  Find elegant way of resolving issue with zero slices. These currently
     have an arbitrary scale tensor, which could lead to some issue later.
     Find a way of setting the scale values *really* small, something like
     the minimum value of the integer datatype
-
-4)  Implement view, reshaping, and element setting operations on stensors
+5)  Implement view, reshaping, and element setting operations on stensors
     with non-scalar scale tensors
-5)  Implement device changing operations (to, cuda, cpu)
+6)  Implement device changing operations (to, cuda, cpu)
+7)  Write custom version of matmul to give better data_dims checking, 
+    given all the behaviors present in the original torch version
 
 """
 
@@ -1030,8 +1047,11 @@ GENERIC_ERROR = NotImplementedError("Something went wrong, please let me "
                                     "know at https://github.com/jemisjoky/STensor/issues")
 
 if __name__ == '__main__':
-    tensor = torch.randn(2, 3, 4, 5)
-    tensor = stensor(tensor)
+    matrix = torch.randn(5, 5)
+    vector = torch.randn(5)
+    vector = stensor(vector)
+    print(matrix.mv(vector))
+    print(torch.mv(matrix, vector).torch())
 
 
     # # Get the nontrivial attributes of a Pytorch tensor

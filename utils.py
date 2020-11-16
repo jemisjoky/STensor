@@ -57,3 +57,6 @@ def flatten_index(idx, scale):
 
 def scalar_scale(stens):
     return stens.scale.numel() == 1
+
+def is_vector(stens):
+    return len(stens.shape) == 1

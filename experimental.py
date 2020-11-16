@@ -1,5 +1,7 @@
 ### Workspace for testing out different functionality ###
-from stable_tensor import *
+
+from stensor import *
+
 # Possible rescaling functions
 def rescale_1_(stens):
     """Simple in-place one-norm based rescaling"""
