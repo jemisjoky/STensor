@@ -4,7 +4,7 @@ from functools import wraps, lru_cache, reduce
 
 import torch
 
-from utils import (bad_conversion, tupleize, squeeze_dims, flatten_index, 
+from .utils import (bad_conversion, tupleize, squeeze_dims, flatten_index, 
                    scalar_scale)
 
 """

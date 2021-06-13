@@ -1,4 +1,4 @@
-# STensor, the _Stable_ Tensor library
+# STensor, the _Stable_ Tensor class
 STensor is an extension of the `Tensor` class used in the popular Pytorch deep learning library, which addresses overflow/underflow issues that occur when multiplicative operations are used frequently. For example, consider the following simple example of iterated matrix-vector multiplication:
 
 ```python
@@ -45,7 +45,7 @@ print(x.torch())
 # >>> tensor([0., 1., 2., 3., 4.])
 ```
 
-## How STensor Works
+## How STensor works
 
 While the above example might look like magic, the underlying mechanism behind STensor is quite simple. Let's look at the massive vector produced by the iterated matrix-vector multiplication above
 
@@ -81,7 +81,7 @@ print(y.scale.shape)
 
 In this case, each dimension-4 "fiber" of the data tensor (i.e. `y[i, j, :]`) will be associated with a separate scale factor, allowing for greater granularity when working with batched data that contains substantial variation in magnitude between different elements in the batch.
 
-## What's the Catch?
+## What's the catch?
 
 Nothing comes for free, and STensor is no exception. At present, the biggest downside of STensor is that it is still in an early stage of development. Many of the core Pytorch functions still have yet to be adapted for STensors, which means that feeding STensors into complex user-written functions will frequently lead to errors. While we eventually aim to make STensor a drop-in replacement for the Pytorch Tensor class, the massive size of the latter means this will take time.
 
